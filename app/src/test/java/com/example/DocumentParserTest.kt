@@ -3,9 +3,11 @@ package com.example
 import com.example.data.parser.DocBinaryParser
 import com.example.data.parser.DocxParser
 import com.example.data.parser.PdfTextExtractor
+import com.example.data.parser.PdfTextWord
 import com.example.data.parser.XlsxParser
 import com.example.domain.model.DocBlock
 import com.example.domain.model.DocumentFormat
+import com.example.ui.viewer.buildPdfTextSegments
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -60,6 +62,22 @@ class DocumentParserTest {
     // Line 1 ("Halo") should be above Line 2 ("Baris") and left of "PDF"
     assertTrue(words[0].right < words[1].right)
     assertTrue(words[0].top < words[2].top)
+  }
+
+  @Test
+  fun `pdf selection segments merge same-line words and split wide column gaps`() {
+    val words =
+      listOf(
+        PdfTextWord("Nama", 0.10f, 0.10f, 0.18f, 0.12f),
+        PdfTextWord("Lengkap", 0.19f, 0.10f, 0.29f, 0.12f),
+        PdfTextWord("Nilai", 0.65f, 0.10f, 0.72f, 0.12f),
+        PdfTextWord("Budi", 0.10f, 0.15f, 0.17f, 0.17f),
+      )
+
+    val segments = buildPdfTextSegments(words)
+    assertEquals(listOf("Nama Lengkap", "Nilai", "Budi"), segments.map { it.text })
+    assertEquals(0.10f, segments[0].left, 0.0001f)
+    assertEquals(0.29f, segments[0].right, 0.0001f)
   }
 
   @Test
