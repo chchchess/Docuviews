@@ -46,6 +46,20 @@ class DocumentParserTest {
     val extracted = PdfTextExtractor.extractFromBytes(pdf, 0)
     assertTrue(extracted.contains("Halo PDF"))
     assertTrue(extracted.contains("Baris Kedua"))
+
+    val words = PdfTextExtractor.extractPageWordsFromBytes(pdf, 0)
+    assertEquals(listOf("Halo", "PDF", "Baris", "Kedua"), words.map { it.text })
+    words.forEach { w ->
+      assertTrue(w.left in 0f..1f)
+      assertTrue(w.right in 0f..1f)
+      assertTrue(w.top in 0f..1f)
+      assertTrue(w.bottom in 0f..1f)
+      assertTrue(w.left < w.right)
+      assertTrue(w.top < w.bottom)
+    }
+    // Line 1 ("Halo") should be above Line 2 ("Baris") and left of "PDF"
+    assertTrue(words[0].right < words[1].right)
+    assertTrue(words[0].top < words[2].top)
   }
 
   @Test

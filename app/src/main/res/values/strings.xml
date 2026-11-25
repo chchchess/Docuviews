@@ -44,12 +44,12 @@
     <string name="dialog_cancel">Batal</string>
     <string name="dialog_confirm_clear">Hapus</string>
     <string name="action_copy_text">Salin teks</string>
+    <string name="action_select_page_text">Pilih semua teks halaman</string>
     <string name="action_copy_all">Salin Semua</string>
     <string name="action_copy_cell">Salin sel</string>
     <string name="action_copy_sheet">Salin sheet</string>
-    <string name="pdf_text_sheet_title">Teks Halaman %1$d</string>
-    <string name="pdf_text_empty">Halaman ini tidak memiliki lapisan teks yang dapat disalin (kemungkinan berupa gambar hasil scan).</string>
-    <string name="pdf_text_hint">Tekan dan tahan teks di bawah untuk memilih sebagian, atau tekan Salin Semua.</string>
+    <string name="pdf_scan_no_text">Halaman ini berupa gambar/scan, teks tidak dapat disalin.</string>
+    <string name="copied_selected_text">Teks disalin</string>
     <string name="copied_page_text">Teks halaman %1$d disalin</string>
     <string name="copied_all_doc">Seluruh teks dokumen disalin</string>
     <string name="copied_cell">Sel %1$s disalin</string>
@@ -59,6 +59,4 @@
     <string name="search_scanning">Mencari…</string>
     <string name="search_no_results">Tidak ditemukan</string>
     <string name="pdf_match_page_snippet">Halaman %1$d</string>
-    <string name="pdf_text_mode_label">Mode Pilih Teks • Hal. %1$d</string>
-    <string name="pdf_exit_text_mode">Lihat Halaman</string>
 </resources>
