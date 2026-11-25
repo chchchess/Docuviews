@@ -1,10 +1,9 @@
 package com.example.ui.viewer
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -65,7 +64,6 @@ private data class ExcelMatchLocation(
   val cell: SpreadsheetCell,
 )
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun ExcelViewerContent(
   document: ParsedDocument.Spreadsheet,
@@ -267,95 +265,88 @@ fun ExcelViewerContent(
 
       HorizontalDivider(color = gridLine, thickness = 1.dp)
 
-      // Virtualized Data Rows synchronized horizontally
-      LazyColumn(
-        state = verticalListState,
-        modifier = Modifier.weight(1f).fillMaxWidth(),
-      ) {
-        itemsIndexed(items = sheet.rows, key = { idx, _ -> "${activeSheetIdx}_row_$idx" }) { rowIdx, rowCells ->
-          val rowBg = if (rowIdx % 2 == 1) zebraBg else MaterialTheme.colorScheme.surface
-          Row(
-            modifier = Modifier.fillMaxWidth().background(rowBg),
-          ) {
-            // Sticky Row Number
-            Box(
-              modifier =
-                Modifier.width(rowHeaderWidth)
-                  .height(42.dp)
-                  .background(headerBg)
-                  .border(0.5.dp, gridLine),
-              contentAlignment = Alignment.Center,
-            ) {
-              Text(
-                text = "${rowIdx + 1}",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-              )
-            }
-
-            // Horizontally scrolling cells (tap to inspect, long-press to copy)
+      // Virtualized Data Rows wrapped in SelectionContainer so long-pressing a cell triggers native text selection
+      SelectionContainer(modifier = Modifier.weight(1f).fillMaxWidth()) {
+        LazyColumn(
+          state = verticalListState,
+          modifier = Modifier.fillMaxSize(),
+        ) {
+          itemsIndexed(items = sheet.rows, key = { idx, _ -> "${activeSheetIdx}_row_$idx" }) { rowIdx, rowCells ->
+            val rowBg = if (rowIdx % 2 == 1) zebraBg else MaterialTheme.colorScheme.surface
             Row(
-              modifier = Modifier.weight(1f).horizontalScroll(horizontalScroll),
+              modifier = Modifier.fillMaxWidth().background(rowBg),
             ) {
-              rowCells.forEach { cell ->
-                val isSelected = selectedCell?.reference == cell.reference
-                val isActiveMatch =
-                  activeMatch?.sheetIndex == activeSheetIdx &&
-                    activeMatch.cell.reference == cell.reference
-                val isMatch =
-                  trimmedQuery.isNotEmpty() &&
-                    cell.displayValue.contains(trimmedQuery, ignoreCase = true)
+              // Sticky Row Number
+              Box(
+                modifier =
+                  Modifier.width(rowHeaderWidth)
+                    .height(42.dp)
+                    .background(headerBg)
+                    .border(0.5.dp, gridLine),
+                contentAlignment = Alignment.Center,
+              ) {
+                Text(
+                  text = "${rowIdx + 1}",
+                  style = MaterialTheme.typography.labelSmall,
+                  color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+              }
 
-                val bg =
-                  when {
-                    isActiveMatch -> Color(0xFFFFB74D).copy(alpha = 0.65f)
-                    isSelected -> ExcelEmerald.copy(alpha = 0.16f)
-                    isMatch -> Color(0xFFFFE082).copy(alpha = 0.55f)
-                    else -> Color.Transparent
+              // Horizontally scrolling cells (tap to inspect, long-press enters native text selection)
+              Row(
+                modifier = Modifier.weight(1f).horizontalScroll(horizontalScroll),
+              ) {
+                rowCells.forEach { cell ->
+                  val isSelected = selectedCell?.reference == cell.reference
+                  val isActiveMatch =
+                    activeMatch?.sheetIndex == activeSheetIdx &&
+                      activeMatch.cell.reference == cell.reference
+                  val isMatch =
+                    trimmedQuery.isNotEmpty() &&
+                      cell.displayValue.contains(trimmedQuery, ignoreCase = true)
+
+                  val bg =
+                    when {
+                      isActiveMatch -> Color(0xFFFFB74D).copy(alpha = 0.65f)
+                      isSelected -> ExcelEmerald.copy(alpha = 0.16f)
+                      isMatch -> Color(0xFFFFE082).copy(alpha = 0.55f)
+                      else -> Color.Transparent
+                    }
+
+                  val borderColor =
+                    when {
+                      isActiveMatch -> Color(0xFFFF9100)
+                      isSelected -> ExcelEmerald
+                      else -> gridLine
+                    }
+
+                  Box(
+                    modifier =
+                      Modifier.width(cellWidthDp)
+                        .height(42.dp)
+                        .background(bg)
+                        .border(
+                          width = if (isSelected || isActiveMatch) 1.5.dp else 0.5.dp,
+                          color = borderColor,
+                        )
+                        .clickable { selectedCell = cell }
+                        .padding(horizontal = 8.dp),
+                    contentAlignment =
+                      if (cell.isNumeric) Alignment.CenterEnd else Alignment.CenterStart,
+                  ) {
+                    Text(
+                      text = cell.displayValue,
+                      style = MaterialTheme.typography.bodySmall,
+                      fontWeight = if (cell.isBold || isActiveMatch) FontWeight.SemiBold else FontWeight.Normal,
+                      color =
+                        if (isMatch || isActiveMatch) Color(0xFF111111)
+                        else MaterialTheme.colorScheme.onSurface,
+                      textAlign = if (cell.isNumeric) TextAlign.End else TextAlign.Start,
+                      maxLines = 2,
+                      overflow = TextOverflow.Ellipsis,
+                      modifier = Modifier.fillMaxWidth(),
+                    )
                   }
-
-                val borderColor =
-                  when {
-                    isActiveMatch -> Color(0xFFFF9100)
-                    isSelected -> ExcelEmerald
-                    else -> gridLine
-                  }
-
-                Box(
-                  modifier =
-                    Modifier.width(cellWidthDp)
-                      .height(42.dp)
-                      .background(bg)
-                      .border(
-                        width = if (isSelected || isActiveMatch) 1.5.dp else 0.5.dp,
-                        color = borderColor,
-                      )
-                      .combinedClickable(
-                        onClick = { selectedCell = cell },
-                        onLongClick = {
-                          selectedCell = cell
-                          if (cell.displayValue.isNotEmpty()) {
-                            copyTextToClipboard(context, cell.reference, cell.displayValue)
-                            onCopyFeedback(context.getString(R.string.copied_cell, cell.reference))
-                          }
-                        },
-                      )
-                      .padding(horizontal = 8.dp),
-                  contentAlignment =
-                    if (cell.isNumeric) Alignment.CenterEnd else Alignment.CenterStart,
-                ) {
-                  Text(
-                    text = cell.displayValue,
-                    style = MaterialTheme.typography.bodySmall,
-                    fontWeight = if (cell.isBold || isActiveMatch) FontWeight.SemiBold else FontWeight.Normal,
-                    color =
-                      if (isMatch || isActiveMatch) Color(0xFF111111)
-                      else MaterialTheme.colorScheme.onSurface,
-                    textAlign = if (cell.isNumeric) TextAlign.End else TextAlign.Start,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.fillMaxWidth(),
-                  )
                 }
               }
             }

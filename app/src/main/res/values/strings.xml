@@ -59,4 +59,6 @@
     <string name="search_scanning">Mencari…</string>
     <string name="search_no_results">Tidak ditemukan</string>
     <string name="pdf_match_page_snippet">Halaman %1$d</string>
+    <string name="pdf_text_mode_label">Mode Pilih Teks • Hal. %1$d</string>
+    <string name="pdf_exit_text_mode">Lihat Halaman</string>
 </resources>
