@@ -6,11 +6,14 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.R
 import com.example.data.DocumentRepository
+import com.example.data.PasswordRequiredException
 import com.example.data.UnsupportedFormatException
 import com.example.data.local.AppDatabase
+import com.example.data.parser.DocBinaryParser
 import com.example.domain.model.DocumentFormat
 import com.example.domain.model.ParsedDocument
 import com.example.domain.model.RecentDocument
+import java.io.File
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -30,6 +33,16 @@ sealed interface ViewerState {
   data object Closed : ViewerState
 
   data class Loading(val fileName: String) : ViewerState
+
+  data class PasswordRequired(
+    val docId: Long,
+    val file: File,
+    val fileName: String,
+    val format: DocumentFormat,
+    val initialPageOrSheet: Int,
+    val isWrongPassword: Boolean = false,
+    val isUnlocking: Boolean = false,
+  ) : ViewerState
 
   data class Ready(
     val docId: Long,
@@ -141,13 +154,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         .onFailure { err ->
-          val msg =
-            when (err) {
-              is UnsupportedFormatException ->
-                getApplication<Application>().getString(R.string.error_unsupported)
-              else -> err.localizedMessage ?: "Tidak dapat membuka file ini."
-            }
-          viewerState.value = ViewerState.Error(message = msg, fileName = label)
+          viewerState.value = mapOpenErrorToState(err, label)
         }
     }
   }
@@ -165,12 +172,64 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         .onFailure { err ->
-          viewerState.value =
-            ViewerState.Error(
-              message = err.localizedMessage ?: "Gagal membuka dokumen.",
-              fileName = recent.fileName,
-            )
+          viewerState.value = mapOpenErrorToState(err, recent.fileName)
         }
+    }
+  }
+
+  fun unlockWithPassword(password: String) {
+    val current = viewerState.value as? ViewerState.PasswordRequired ?: return
+    viewerState.value = current.copy(isUnlocking = true, isWrongPassword = false)
+    viewModelScope.launch {
+      runCatching {
+        repository.unlockDocumentWithPassword(
+          docId = current.docId,
+          file = current.file,
+          fileName = current.fileName,
+          format = current.format,
+          initialPageOrSheet = current.initialPageOrSheet,
+          password = password,
+        )
+      }.onSuccess { parsed ->
+        viewerState.value =
+          ViewerState.Ready(
+            docId = current.docId,
+            document = parsed,
+            initialPageOrSheet = current.initialPageOrSheet,
+          )
+      }.onFailure { err ->
+        viewerState.value = mapOpenErrorToState(err, current.fileName)
+      }
+    }
+  }
+
+  private fun mapOpenErrorToState(err: Throwable, fallbackName: String?): ViewerState {
+    return when (err) {
+      is PasswordRequiredException ->
+        ViewerState.PasswordRequired(
+          docId = err.docId,
+          file = err.file,
+          fileName = err.fileName,
+          format = err.format,
+          initialPageOrSheet = err.initialPageOrSheet,
+          isWrongPassword = err.isWrongPassword,
+          isUnlocking = false,
+        )
+      is UnsupportedFormatException ->
+        ViewerState.Error(
+          message = getApplication<Application>().getString(R.string.error_unsupported),
+          fileName = fallbackName,
+        )
+      is DocBinaryParser.EncryptedLegacyDocException ->
+        ViewerState.Error(
+          message = getApplication<Application>().getString(R.string.password_legacy_doc_unsupported),
+          fileName = fallbackName,
+        )
+      else ->
+        ViewerState.Error(
+          message = err.localizedMessage ?: "Gagal membuka dokumen.",
+          fileName = fallbackName,
+        )
     }
   }
 

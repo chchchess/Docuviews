@@ -5,6 +5,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -14,6 +17,7 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -124,7 +128,14 @@ fun PdfViewerContent(
 ) {
   val context = LocalContext.current
   val haptic = LocalHapticFeedback.current
-  val helper = remember(document.file.absolutePath) { PdfRendererHelper(document.file) }
+  val helper =
+    remember(document.file.absolutePath, document.password) {
+      PdfRendererHelper(
+        file = document.file,
+        password = document.password,
+        cacheDir = context.cacheDir,
+      )
+    }
   DisposableEffect(helper) { onDispose { helper.close() } }
 
   val totalPages = helper.pageCount.coerceAtLeast(1)
@@ -134,6 +145,12 @@ fun PdfViewerContent(
 
   val currentPage by remember { derivedStateOf { listState.firstVisibleItemIndex } }
   LaunchedEffect(currentPage) { onPageChanged(currentPage) }
+
+  // Pre-render neighboring pages quietly in background so vertical scrolling feels instant
+  LaunchedEffect(currentPage, helper) {
+    delay(60)
+    helper.prefetchPages(currentPage)
+  }
 
   var searchHits by remember { mutableStateOf<List<PdfSearchHit>>(emptyList()) }
   val trimmedQuery = searchQuery.trim()
@@ -164,11 +181,25 @@ fun PdfViewerContent(
     }
   }
 
-  var zoomScale by remember { mutableFloatStateOf(1f) }
+  val zoomScaleAnim = remember { Animatable(1f) }
   var panOffsetX by remember { mutableFloatStateOf(0f) }
   var panOffsetY by remember { mutableFloatStateOf(0f) }
   var nightInvert by remember { mutableStateOf(false) }
   var showJumpDialog by remember { mutableStateOf(false) }
+
+  fun animateZoomTo(target: Float) {
+    val clamped = target.coerceIn(1f, 3.5f)
+    scope.launch {
+      if (clamped <= 1.02f) {
+        panOffsetX = 0f
+        panOffsetY = 0f
+      }
+      zoomScaleAnim.animateTo(
+        targetValue = clamped,
+        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+      )
+    }
+  }
 
   val hitsByPage = remember(searchHits) { searchHits.groupBy { it.pageIndex } }
 
@@ -178,33 +209,45 @@ fun PdfViewerContent(
         .fillMaxSize()
         .background(if (nightInvert) Color(0xFF0E1014) else MaterialTheme.colorScheme.surfaceVariant),
   ) {
-    // Handle multi-finger pinch zoom & pan while zoomed; single-finger scroll & long-press pass cleanly to PdfSelectionContainer
+    // Fast-path zoom/pan: zero math overhead on single-finger 1x vertical flings + smooth double-tap zoom
     Box(
       modifier =
         Modifier.fillMaxSize()
+          .pointerInput(Unit) {
+            detectTapGestures(
+              onDoubleTap = {
+                if (zoomScaleAnim.value > 1.15f) {
+                  animateZoomTo(1f)
+                } else {
+                  animateZoomTo(2f)
+                }
+              },
+            )
+          }
           .pointerInput(Unit) {
             awaitEachGesture {
               awaitFirstDown(requireUnconsumed = false)
               do {
                 val event = awaitPointerEvent()
                 val pressedCount = event.changes.count { it.pressed }
-                if (pressedCount >= 2 || zoomScale > 1.02f) {
-                  val zoom = event.calculateZoom()
-                  val pan = event.calculatePan()
-                  if (zoom != 1f || (zoomScale > 1.02f && pan != Offset.Zero)) {
-                    val nextScale = (zoomScale * zoom).coerceIn(1f, 3.5f)
-                    zoomScale = nextScale
-                    if (nextScale > 1.02f) {
-                      val maxX = size.width * (nextScale - 1f) * 0.5f
-                      val maxY = size.height * (nextScale - 1f) * 0.25f
-                      panOffsetX = (panOffsetX + pan.x).coerceIn(-maxX, maxX)
-                      panOffsetY = (panOffsetY + pan.y).coerceIn(-maxY, maxY)
-                    } else {
-                      panOffsetX = 0f
-                      panOffsetY = 0f
-                    }
-                    event.changes.forEach { it.consume() }
+                val curZoom = zoomScaleAnim.value
+                if (pressedCount < 2 && curZoom <= 1.02f) continue
+
+                val zoom = event.calculateZoom()
+                val pan = event.calculatePan()
+                if (zoom != 1f || (curZoom > 1.02f && pan != Offset.Zero)) {
+                  val nextScale = (curZoom * zoom).coerceIn(1f, 3.5f)
+                  scope.launch { zoomScaleAnim.snapTo(nextScale) }
+                  if (nextScale > 1.02f) {
+                    val maxX = size.width * (nextScale - 1f) * 0.5f
+                    val maxY = size.height * (nextScale - 1f) * 0.25f
+                    panOffsetX = (panOffsetX + pan.x).coerceIn(-maxX, maxX)
+                    panOffsetY = (panOffsetY + pan.y).coerceIn(-maxY, maxY)
+                  } else {
+                    panOffsetX = 0f
+                    panOffsetY = 0f
                   }
+                  event.changes.forEach { it.consume() }
                 }
               } while (event.changes.any { it.pressed })
             }
@@ -215,8 +258,9 @@ fun PdfViewerContent(
         modifier =
           Modifier.fillMaxSize()
             .graphicsLayer {
-              scaleX = zoomScale
-              scaleY = zoomScale
+              val s = zoomScaleAnim.value
+              scaleX = s
+              scaleY = s
               translationX = panOffsetX
               translationY = panOffsetY
             },
@@ -230,7 +274,11 @@ fun PdfViewerContent(
         verticalArrangement = Arrangement.spacedBy(12.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
       ) {
-        items(count = helper.pageCount, key = { it }) { pageIndex ->
+        items(
+          count = helper.pageCount,
+          key = { it },
+          contentType = { "pdf_page" },
+        ) { pageIndex ->
           PdfPageCard(
             helper = helper,
             pageIndex = pageIndex,
@@ -324,13 +372,7 @@ fun PdfViewerContent(
         }
 
         IconButton(
-          onClick = {
-            zoomScale = (zoomScale - 0.35f).coerceIn(1f, 3.5f)
-            if (zoomScale <= 1.02f) {
-              panOffsetX = 0f
-              panOffsetY = 0f
-            }
-          },
+          onClick = { animateZoomTo(zoomScaleAnim.value - 0.35f) },
           modifier = Modifier.minimumInteractiveComponentSize().testTag("pdf_zoom_out"),
         ) {
           Icon(
@@ -340,21 +382,17 @@ fun PdfViewerContent(
         }
 
         TextButton(
-          onClick = {
-            zoomScale = 1f
-            panOffsetX = 0f
-            panOffsetY = 0f
-          },
+          onClick = { animateZoomTo(1f) },
           modifier = Modifier.testTag("pdf_zoom_reset"),
         ) {
           Text(
-            text = "${(zoomScale * 100).roundToInt()}%",
+            text = "${(zoomScaleAnim.value * 100).roundToInt()}%",
             style = MaterialTheme.typography.labelSmall,
           )
         }
 
         IconButton(
-          onClick = { zoomScale = (zoomScale + 0.35f).coerceIn(1f, 3.5f) },
+          onClick = { animateZoomTo(zoomScaleAnim.value + 0.35f) },
           modifier = Modifier.minimumInteractiveComponentSize().testTag("pdf_zoom_in"),
         ) {
           Icon(
@@ -447,22 +485,25 @@ private fun PdfPageCard(
 
   val wordsState by
     produceState<List<PdfTextWord>?>(initialValue = null, key1 = pageIndex, key2 = helper) {
+      delay(150)
       value = helper.extractPageWords(pageIndex)
     }
 
   val bmp = bitmapState
+  val placeholderRatio = remember(pageIndex, helper) { helper.getCachedAspectRatio(pageIndex) ?: 0.71f }
+
   Surface(
     modifier =
       Modifier.widthIn(max = 820.dp)
         .fillMaxWidth()
-        .shadow(3.dp, RoundedCornerShape(8.dp)),
+        .shadow(2.dp, RoundedCornerShape(8.dp)),
     shape = RoundedCornerShape(8.dp),
     color = if (nightInvert) Color(0xFF121417) else Color.White,
     border = if (isHighlightedPage) BorderStroke(2.dp, Color(0xFFFF9100)) else null,
   ) {
     if (bmp == null) {
       Box(
-        modifier = Modifier.fillMaxWidth().aspectRatio(0.71f),
+        modifier = Modifier.fillMaxWidth().aspectRatio(placeholderRatio),
         contentAlignment = Alignment.Center,
       ) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {

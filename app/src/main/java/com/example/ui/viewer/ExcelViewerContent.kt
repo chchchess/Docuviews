@@ -43,7 +43,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -271,7 +273,11 @@ fun ExcelViewerContent(
           state = verticalListState,
           modifier = Modifier.fillMaxSize(),
         ) {
-          itemsIndexed(items = sheet.rows, key = { idx, _ -> "${activeSheetIdx}_row_$idx" }) { rowIdx, rowCells ->
+          itemsIndexed(
+            items = sheet.rows,
+            key = { idx, _ -> "${activeSheetIdx}_row_$idx" },
+            contentType = { _, _ -> "excel_row" },
+          ) { rowIdx, rowCells ->
             val rowBg = if (rowIdx % 2 == 1) zebraBg else MaterialTheme.colorScheme.surface
             Row(
               modifier = Modifier.fillMaxWidth().background(rowBg),
@@ -325,10 +331,10 @@ fun ExcelViewerContent(
                       Modifier.width(cellWidthDp)
                         .height(42.dp)
                         .background(bg)
-                        .border(
-                          width = if (isSelected || isActiveMatch) 1.5.dp else 0.5.dp,
-                          color = borderColor,
-                        )
+                        .drawBehind {
+                          val strokePx = if (isSelected || isActiveMatch) 1.5.dp.toPx() else 0.5.dp.toPx()
+                          drawRect(color = borderColor, style = Stroke(width = strokePx))
+                        }
                         .clickable { selectedCell = cell }
                         .padding(horizontal = 8.dp),
                     contentAlignment =

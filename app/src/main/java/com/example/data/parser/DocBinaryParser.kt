@@ -17,22 +17,8 @@ import kotlin.math.min
  */
 object DocBinaryParser {
 
-  private val OLE2_MAGIC = byteArrayOf(
-    0xD0.toByte(), 0xCF.toByte(), 0x11.toByte(), 0xE0.toByte(),
-    0xA1.toByte(), 0xB1.toByte(), 0x1A.toByte(), 0xE1.toByte(),
-  )
-
-  private const val FREE_SECT = -1
-  private const val END_OF_CHAIN = -2
-  private const val FAT_SECT = -3
-  private const val DIF_SECT = -4
-  private const val NO_STREAM = -1
-
-  private data class DirEntry(
-    val name: String,
-    val type: Int,
-    val startSector: Int,
-    val streamSize: Long,
+  class EncryptedLegacyDocException : IllegalStateException(
+    "File .doc (Word 97-2003) yang terenkripsi tidak didukung. Simpan ulang sebagai .docx atau .pdf untuk membukanya."
   )
 
   fun parse(file: File, displayName: String = file.name): ParsedDocument.RichText {
@@ -56,7 +42,7 @@ object DocBinaryParser {
       return ParsedDocument.RichText(file, displayName, DocumentFormat.DOC, blocks, isLegacyNotice = true)
     }
 
-    if (bytes.size >= 512 && bytes.copyOfRange(0, 8).contentEquals(OLE2_MAGIC)) {
+    if (Ole2CompoundReader.isOle2(bytes)) {
       val rawText = extractTextFromOle2(bytes)
       val blocks = rawTextToBlocks(rawText)
       return ParsedDocument.RichText(
@@ -80,95 +66,23 @@ object DocBinaryParser {
   }
 
   private fun extractTextFromOle2(data: ByteArray): String {
-    val buf = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
-    val sectorShift = buf.getShort(0x1E).toInt() and 0xFFFF
-    val miniSectorShift = buf.getShort(0x20).toInt() and 0xFFFF
-    val sectorSize = 1 shl sectorShift.coerceIn(9, 12)
-    val miniSectorSize = 1 shl miniSectorShift.coerceIn(6, 9)
-
-    val firstDirSector = buf.getInt(0x30)
-    val miniStreamCutoff = buf.getInt(0x38)
-    val firstMiniFatSector = buf.getInt(0x3C)
-    val firstDifatSector = buf.getInt(0x44)
-    val difatSectorCount = buf.getInt(0x48)
-
-    // Build FAT sector index list (first 109 in header at offset 0x4C)
-    val fatSectorIds = mutableListOf<Int>()
-    for (i in 0 until 109) {
-      val sid = buf.getInt(0x4C + i * 4)
-      if (sid >= 0) fatSectorIds.add(sid)
-    }
-    var difatSec = firstDifatSector
-    var difatLoops = 0
-    while (difatSec >= 0 && difatLoops < difatSectorCount + 16) {
-      difatLoops++
-      val off = sectorOffset(difatSec, sectorSize)
-      if (off + sectorSize > data.size) break
-      val entriesPerSec = (sectorSize / 4) - 1
-      for (i in 0 until entriesPerSec) {
-        val sid = buf.getInt(off + i * 4)
-        if (sid >= 0) fatSectorIds.add(sid)
-      }
-      difatSec = buf.getInt(off + entriesPerSec * 4)
-    }
-
-    val intsPerFat = sectorSize / 4
-    val fat = IntArray(fatSectorIds.size * intsPerFat) { END_OF_CHAIN }
-    fatSectorIds.forEachIndexed { idx, sid ->
-      val off = sectorOffset(sid, sectorSize)
-      if (off + sectorSize <= data.size) {
-        for (j in 0 until intsPerFat) {
-          fat[idx * intsPerFat + j] = buf.getInt(off + j * 4)
-        }
-      }
-    }
-
-    // Read Directory Stream
-    val dirBytes = readFatStream(data, fat, firstDirSector, sectorSize, -1)
-    val dirEntries = parseDirectoryEntries(dirBytes)
-    val rootEntry = dirEntries.firstOrNull { it.type == 5 }
-
-    val miniStreamBytes =
-      if (rootEntry != null && rootEntry.startSector >= 0 && rootEntry.streamSize > 0) {
-        readFatStream(data, fat, rootEntry.startSector, sectorSize, rootEntry.streamSize.toInt())
-      } else {
-        ByteArray(0)
-      }
-
-    val miniFatBytes =
-      if (firstMiniFatSector >= 0) {
-        readFatStream(data, fat, firstMiniFatSector, sectorSize, -1)
-      } else {
-        ByteArray(0)
-      }
-    val miniFat = IntArray(miniFatBytes.size / 4)
-    if (miniFat.isNotEmpty()) {
-      ByteBuffer.wrap(miniFatBytes).order(ByteOrder.LITTLE_ENDIAN).asIntBuffer().get(miniFat)
-    }
-
-    fun readEntryStream(entry: DirEntry): ByteArray {
-      return if (entry.type != 5 && entry.streamSize < miniStreamCutoff && miniStreamBytes.isNotEmpty()) {
-        readMiniStream(miniStreamBytes, miniFat, entry.startSector, miniSectorSize, entry.streamSize.toInt())
-      } else {
-        readFatStream(data, fat, entry.startSector, sectorSize, entry.streamSize.toInt())
-      }
-    }
-
-    val wordDocEntry =
-      dirEntries.firstOrNull { it.name == "WordDocument" }
+    val streams = Ole2CompoundReader.readStreams(data)
+    val wordDoc =
+      streams["WordDocument"]
         ?: throw IllegalArgumentException("Stream WordDocument tidak ditemukan di file .doc")
-    val wordDoc = readEntryStream(wordDocEntry)
     if (wordDoc.size < 512) {
       throw IllegalArgumentException("Header WordDocument tidak lengkap")
     }
 
     val wBuf = ByteBuffer.wrap(wordDoc).order(ByteOrder.LITTLE_ENDIAN)
     val flags = wBuf.getShort(0x0A).toInt() and 0xFFFF
+    val isEncrypted = (flags and 0x0100) != 0
+    if (isEncrypted) {
+      throw EncryptedLegacyDocException()
+    }
     val use1Table = (flags and 0x0200) != 0
     val tableName = if (use1Table) "1Table" else "0Table"
-    val tableEntry =
-      dirEntries.firstOrNull { it.name == tableName }
-        ?: dirEntries.firstOrNull { it.name == "1Table" || it.name == "0Table" }
+    val tableStream = streams[tableName] ?: streams["1Table"] ?: streams["0Table"]
 
     val ccpText = wBuf.getInt(0x4C)
     val ccpFtn = wBuf.getInt(0x50)
@@ -176,11 +90,10 @@ object DocBinaryParser {
     val mainCharLimit = if (ccpText > 0) ccpText else Int.MAX_VALUE
 
     // Try extracting via Piece Table (fcClx at offset 0x01A2, lcbClx at 0x01A6)
-    if (tableEntry != null && wordDoc.size >= 0x01AA) {
+    if (tableStream != null && wordDoc.size >= 0x01AA) {
       val fcClx = wBuf.getInt(0x01A2)
       val lcbClx = wBuf.getInt(0x01A6)
       if (fcClx >= 0 && lcbClx > 0) {
-        val tableStream = readEntryStream(tableEntry)
         val extracted = extractViaPieceTable(wordDoc, tableStream, fcClx, lcbClx, mainCharLimit)
         if (extracted.isNotBlank()) return extracted
       }
@@ -264,82 +177,6 @@ object DocBinaryParser {
       }
     }
     return ""
-  }
-
-  private fun sectorOffset(sectorId: Int, sectorSize: Int): Int = (sectorId + 1) * sectorSize
-
-  private fun readFatStream(
-    data: ByteArray,
-    fat: IntArray,
-    startSector: Int,
-    sectorSize: Int,
-    expectedSize: Int,
-  ): ByteArray {
-    if (startSector < 0) return ByteArray(0)
-    val chunks = mutableListOf<ByteArray>()
-    var current = startSector
-    var totalRead = 0
-    val visited = HashSet<Int>()
-    while (current >= 0 && current < fat.size && visited.add(current)) {
-      val off = sectorOffset(current, sectorSize)
-      if (off >= data.size) break
-      val len = min(sectorSize, data.size - off)
-      chunks.add(data.copyOfRange(off, off + len))
-      totalRead += len
-      if (expectedSize in 1..totalRead) break
-      current = fat[current]
-    }
-    val outSize = if (expectedSize > 0) min(expectedSize, totalRead) else totalRead
-    val out = ByteArray(outSize)
-    var pos = 0
-    for (chunk in chunks) {
-      val toCopy = min(chunk.size, outSize - pos)
-      if (toCopy <= 0) break
-      System.arraycopy(chunk, 0, out, pos, toCopy)
-      pos += toCopy
-    }
-    return out
-  }
-
-  private fun readMiniStream(
-    miniStream: ByteArray,
-    miniFat: IntArray,
-    startSector: Int,
-    miniSectorSize: Int,
-    expectedSize: Int,
-  ): ByteArray {
-    if (startSector < 0 || expectedSize <= 0) return ByteArray(0)
-    val out = ByteArray(expectedSize)
-    var current = startSector
-    var pos = 0
-    val visited = HashSet<Int>()
-    while (current >= 0 && current < miniFat.size && pos < expectedSize && visited.add(current)) {
-      val off = current * miniSectorSize
-      if (off >= miniStream.size) break
-      val toCopy = min(miniSectorSize, min(expectedSize - pos, miniStream.size - off))
-      System.arraycopy(miniStream, off, out, pos, toCopy)
-      pos += toCopy
-      current = miniFat[current]
-    }
-    return out
-  }
-
-  private fun parseDirectoryEntries(dirBytes: ByteArray): List<DirEntry> {
-    val entries = mutableListOf<DirEntry>()
-    val count = dirBytes.size / 128
-    val buf = ByteBuffer.wrap(dirBytes).order(ByteOrder.LITTLE_ENDIAN)
-    for (i in 0 until count) {
-      val base = i * 128
-      val type = dirBytes[base + 66].toInt() and 0xFF
-      if (type == 0) continue
-      val nameLen = (buf.getShort(base + 64).toInt() and 0xFFFF).coerceIn(0, 64)
-      val nameBytes = if (nameLen >= 2) nameLen - 2 else 0
-      val name = String(dirBytes, base, nameBytes, Charsets.UTF_16LE)
-      val startSector = buf.getInt(base + 116)
-      val sizeLow = buf.getInt(base + 120).toLong() and 0xFFFFFFFFL
-      entries.add(DirEntry(name, type, startSector, sizeLow))
-    }
-    return entries
   }
 
   private fun rawTextToBlocks(raw: String): List<DocBlock> {

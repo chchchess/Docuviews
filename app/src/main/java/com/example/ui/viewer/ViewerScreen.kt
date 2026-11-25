@@ -17,6 +17,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -24,8 +25,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.ErrorOutline
+import androidx.compose.material.icons.outlined.Lock
 import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Share
+import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material3.Button
@@ -34,6 +38,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
@@ -60,7 +65,11 @@ import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -83,6 +92,7 @@ fun ViewerScreen(
   onBack: () -> Unit,
   onPickAnotherFile: () -> Unit,
   onUpdateProgress: (docId: Long, index: Int) -> Unit,
+  onSubmitPassword: (String) -> Unit,
 ) {
   BackHandler(onBack = onBack)
 
@@ -166,6 +176,20 @@ fun ViewerScreen(
                   maxLines = 1,
                   overflow = TextOverflow.Ellipsis,
                 )
+              }
+              is ViewerState.PasswordRequired -> {
+                Row(
+                  verticalAlignment = Alignment.CenterVertically,
+                  horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                  FormatPill(format = viewerState.format)
+                  Text(
+                    text = viewerState.fileName,
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                  )
+                }
               }
               is ViewerState.Error -> {
                 Text(
@@ -254,6 +278,14 @@ fun ViewerScreen(
           }
         }
 
+        is ViewerState.PasswordRequired -> {
+          PasswordPromptContent(
+            state = viewerState,
+            onSubmit = onSubmitPassword,
+            onCancel = onBack,
+          )
+        }
+
         is ViewerState.Error -> {
           Column(
             modifier = Modifier.fillMaxSize().padding(24.dp),
@@ -323,6 +355,162 @@ fun ViewerScreen(
         }
 
         ViewerState.Closed -> Unit
+      }
+    }
+  }
+}
+
+@Composable
+private fun PasswordPromptContent(
+  state: ViewerState.PasswordRequired,
+  onSubmit: (String) -> Unit,
+  onCancel: () -> Unit,
+) {
+  var password by remember(state.file.absolutePath) { mutableStateOf("") }
+  var passwordVisible by remember { mutableStateOf(false) }
+  var emptyError by remember(state.isWrongPassword) { mutableStateOf(false) }
+  val focusRequester = remember { FocusRequester() }
+
+  LaunchedEffect(state.file.absolutePath) {
+    runCatching { focusRequester.requestFocus() }
+  }
+
+  val submit = {
+    if (password.isEmpty()) {
+      emptyError = true
+    } else if (!state.isUnlocking) {
+      emptyError = false
+      onSubmit(password)
+    }
+  }
+
+  Box(
+    modifier = Modifier.fillMaxSize().padding(24.dp),
+    contentAlignment = Alignment.Center,
+  ) {
+    Surface(
+      modifier = Modifier.widthIn(max = 440.dp).fillMaxWidth(),
+      shape = RoundedCornerShape(20.dp),
+      color = MaterialTheme.colorScheme.surface,
+      border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline),
+      tonalElevation = 2.dp,
+    ) {
+      Column(
+        modifier = Modifier.fillMaxWidth().padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+      ) {
+        Surface(
+          modifier = Modifier.size(56.dp),
+          shape = RoundedCornerShape(16.dp),
+          color = MaterialTheme.colorScheme.primaryContainer,
+        ) {
+          Box(contentAlignment = Alignment.Center) {
+            Icon(
+              imageVector = Icons.Outlined.Lock,
+              contentDescription = null,
+              tint = MaterialTheme.colorScheme.onPrimaryContainer,
+              modifier = Modifier.size(28.dp),
+            )
+          }
+        }
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+          text = stringResource(R.string.password_required_title),
+          style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+          textAlign = TextAlign.Center,
+        )
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+          text = stringResource(R.string.password_required_desc),
+          style = MaterialTheme.typography.bodyMedium,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          textAlign = TextAlign.Center,
+        )
+        Spacer(modifier = Modifier.height(20.dp))
+
+        val isError = emptyError || state.isWrongPassword
+        OutlinedTextField(
+          value = password,
+          onValueChange = {
+            password = it
+            emptyError = false
+          },
+          modifier =
+            Modifier.fillMaxWidth()
+              .focusRequester(focusRequester)
+              .testTag("password_input"),
+          label = { Text(stringResource(R.string.password_field_label)) },
+          singleLine = true,
+          enabled = !state.isUnlocking,
+          isError = isError,
+          visualTransformation =
+            if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+          keyboardOptions =
+            KeyboardOptions(
+              keyboardType = KeyboardType.Password,
+              imeAction = ImeAction.Done,
+            ),
+          keyboardActions = KeyboardActions(onDone = { submit() }),
+          trailingIcon = {
+            IconButton(
+              onClick = { passwordVisible = !passwordVisible },
+              modifier = Modifier.minimumInteractiveComponentSize().testTag("password_visibility_toggle"),
+            ) {
+              Icon(
+                imageVector =
+                  if (passwordVisible) Icons.Outlined.VisibilityOff else Icons.Outlined.Visibility,
+                contentDescription =
+                  stringResource(
+                    if (passwordVisible) R.string.password_hide else R.string.password_show
+                  ),
+              )
+            }
+          },
+          supportingText =
+            if (isError) {
+              {
+                Text(
+                  text =
+                    stringResource(
+                      if (emptyError) R.string.password_empty_error else R.string.password_wrong_error
+                    ),
+                  color = MaterialTheme.colorScheme.error,
+                )
+              }
+            } else {
+              null
+            },
+          shape = RoundedCornerShape(14.dp),
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+          OutlinedButton(
+            onClick = onCancel,
+            enabled = !state.isUnlocking,
+            modifier = Modifier.weight(1f).minimumInteractiveComponentSize().testTag("password_cancel_button"),
+          ) {
+            Text(stringResource(R.string.dialog_cancel))
+          }
+          Button(
+            onClick = submit,
+            enabled = !state.isUnlocking,
+            modifier = Modifier.weight(1.4f).minimumInteractiveComponentSize().testTag("password_submit_button"),
+          ) {
+            if (state.isUnlocking) {
+              CircularProgressIndicator(
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.dp,
+                color = MaterialTheme.colorScheme.onPrimary,
+              )
+            } else {
+              Text(stringResource(R.string.password_submit))
+            }
+          }
+        }
       }
     }
   }

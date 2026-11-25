@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.RectF
+import android.graphics.pdf.LoadParams
 import android.graphics.pdf.PdfRenderer
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -23,25 +24,53 @@ data class PdfSearchHit(
   val rects: List<PdfTextWord> = emptyList(),
 )
 
-class PdfRendererHelper(private val file: File) : Closeable {
+class PdfRendererHelper(
+  private val file: File,
+  private val password: String? = null,
+  cacheDir: File? = null,
+) : Closeable {
   private val mutex = Mutex()
+
+  private val decryptedTempFile: File? =
+    if (
+      Build.VERSION.SDK_INT < Build.VERSION_CODES.VANILLA_ICE_CREAM &&
+        password != null &&
+        PdfDecryptor.isEncryptedPdf(file)
+    ) {
+      val dir = cacheDir ?: file.parentFile ?: File(".")
+      PdfDecryptor.decryptToTempFile(file, password, dir)
+    } else {
+      null
+    }
+
+  private val effectiveFile: File = decryptedTempFile ?: file
+
   private val pfd: ParcelFileDescriptor =
-    ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
-  private val renderer: PdfRenderer = PdfRenderer(pfd)
+    ParcelFileDescriptor.open(effectiveFile, ParcelFileDescriptor.MODE_READ_ONLY)
+
+  private val renderer: PdfRenderer =
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM && password != null && decryptedTempFile == null) {
+      PdfRenderer(pfd, LoadParams.Builder().setPassword(password).build())
+    } else {
+      PdfRenderer(pfd)
+    }
 
   val pageCount: Int
     get() = renderer.pageCount
 
-  // Keep rendered pages cached in memory (up to ~36 MB)
+  // Keep rendered pages cached in memory (up to ~48 MB) for silky-smooth flinging
   private val cache: LruCache<Int, Bitmap> =
-    object : LruCache<Int, Bitmap>(36 * 1024 * 1024) {
+    object : LruCache<Int, Bitmap>(48 * 1024 * 1024) {
       override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount
     }
 
   private val pageTextCache = ConcurrentHashMap<Int, String>()
   private val pageWordsCache = ConcurrentHashMap<Int, List<PdfTextWord>>()
+  private val pageAspectRatioCache = ConcurrentHashMap<Int, Float>()
 
-  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1440): Bitmap? =
+  fun getCachedAspectRatio(pageIndex: Int): Float? = pageAspectRatioCache[pageIndex]
+
+  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1280): Bitmap? =
     withContext(Dispatchers.IO) {
       if (pageIndex < 0 || pageIndex >= pageCount) return@withContext null
       cache.get(pageIndex)?.let { cached ->
@@ -55,6 +84,9 @@ class PdfRendererHelper(private val file: File) : Closeable {
 
         val page = renderer.openPage(pageIndex)
         try {
+          val ratio = (page.width.toFloat() / page.height.coerceAtLeast(1)).coerceIn(0.4f, 2.5f)
+          pageAspectRatioCache[pageIndex] = ratio
+
           val safeWidth = targetWidthPx.coerceIn(480, 2048)
           val scale = safeWidth.toFloat() / page.width.coerceAtLeast(1)
           val height = (page.height * scale).roundToInt().coerceIn(200, 4096)
@@ -62,6 +94,7 @@ class PdfRendererHelper(private val file: File) : Closeable {
           val canvas = Canvas(bitmap)
           canvas.drawColor(Color.WHITE)
           page.render(bitmap, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+          bitmap.prepareToDraw()
           cache.put(pageIndex, bitmap)
           bitmap
         } finally {
@@ -69,6 +102,18 @@ class PdfRendererHelper(private val file: File) : Closeable {
         }
       }
     }
+
+  suspend fun prefetchPages(centerPage: Int, targetWidthPx: Int = 1280) {
+    val candidates = listOf(centerPage + 1, centerPage + 2, centerPage - 1)
+    for (idx in candidates) {
+      if (idx in 0 until pageCount) {
+        val existing = cache.get(idx)
+        if (existing == null || existing.isRecycled) {
+          renderPage(idx, targetWidthPx)
+        }
+      }
+    }
+  }
 
   suspend fun extractPageWords(pageIndex: Int): List<PdfTextWord> =
     withContext(Dispatchers.IO) {
@@ -98,9 +143,9 @@ class PdfRendererHelper(private val file: File) : Closeable {
                 page.close()
               }
             }
-          nativeWords.ifEmpty { PdfTextExtractor.extractPageWords(file, pageIndex) }
+          nativeWords.ifEmpty { PdfTextExtractor.extractPageWords(effectiveFile, pageIndex) }
         } else {
-          PdfTextExtractor.extractPageWords(file, pageIndex)
+          PdfTextExtractor.extractPageWords(effectiveFile, pageIndex)
         }
 
       pageWordsCache[pageIndex] = extracted
@@ -124,9 +169,9 @@ class PdfRendererHelper(private val file: File) : Closeable {
             } finally {
               page.close()
             }
-          }.ifEmpty { PdfTextExtractor.extractPageText(file, pageIndex) }
+          }.ifEmpty { PdfTextExtractor.extractPageText(effectiveFile, pageIndex) }
         } else {
-          PdfTextExtractor.extractPageText(file, pageIndex)
+          PdfTextExtractor.extractPageText(effectiveFile, pageIndex)
         }
 
       pageTextCache[pageIndex] = extracted
@@ -241,7 +286,6 @@ class PdfRendererHelper(private val file: File) : Closeable {
       return
     }
 
-    // Multiple rects representing segments on one or more lines: distribute words proportionally by total width
     val tokens = rawText.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
     if (tokens.isEmpty()) return
     val totalChars = tokens.sumOf { it.length }.coerceAtLeast(1)
@@ -300,7 +344,9 @@ class PdfRendererHelper(private val file: File) : Closeable {
     cache.evictAll()
     pageTextCache.clear()
     pageWordsCache.clear()
+    pageAspectRatioCache.clear()
     runCatching { renderer.close() }
     runCatching { pfd.close() }
+    runCatching { decryptedTempFile?.delete() }
   }
 }

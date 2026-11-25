@@ -2,20 +2,31 @@ package com.example
 
 import com.example.data.parser.DocBinaryParser
 import com.example.data.parser.DocxParser
+import com.example.data.parser.OfficeDecryptor
+import com.example.data.parser.PdfDecryptor
 import com.example.data.parser.PdfTextExtractor
 import com.example.data.parser.PdfTextWord
 import com.example.data.parser.XlsxParser
 import com.example.domain.model.DocBlock
 import com.example.domain.model.DocumentFormat
 import com.example.ui.viewer.buildPdfTextSegments
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import javax.crypto.Cipher
+import javax.crypto.spec.SecretKeySpec
 
 class DocumentParserTest {
 
@@ -224,6 +235,239 @@ class DocumentParserTest {
     val p2 = parsed.blocks[1] as DocBlock.Paragraph
     assertEquals("Halo Dunia", p1.spans.first().text)
     assertEquals("Baris Kedua", p2.spans.first().text)
+  }
+
+  @Test
+  fun `pdf decryptor rejects wrong password and unlocks RC4-128 PDF`() {
+    val padding =
+      byteArrayOf(
+        0x28, 0xBF.toByte(), 0x4E, 0x5E, 0x4E, 0x75, 0x8A.toByte(), 0x41,
+        0x64, 0x00, 0x4E, 0x56, 0xFF.toByte(), 0xFA.toByte(), 0x01, 0x08,
+        0x2E, 0x2E, 0x00, 0xB6.toByte(), 0xD0.toByte(), 0x68, 0x3E, 0x80.toByte(),
+        0x2F, 0x0C, 0xA9.toByte(), 0xFE.toByte(), 0x64, 0x53, 0x69, 0x7A,
+      )
+    val userPwd = "rahasia123".toByteArray(Charsets.ISO_8859_1)
+    val paddedUser = ByteArray(32).apply {
+      System.arraycopy(userPwd, 0, this, 0, userPwd.size)
+      System.arraycopy(padding, 0, this, userPwd.size, 32 - userPwd.size)
+    }
+    val md5 = MessageDigest.getInstance("MD5")
+    var oKey = md5.digest(paddedUser)
+    repeat(50) { oKey = md5.digest(oKey) }
+    var oBytes = paddedUser.copyOf()
+    for (i in 0..19) {
+      val k = ByteArray(16) { idx -> (oKey[idx].toInt() xor i).toByte() }
+      oBytes = Cipher.getInstance("RC4").apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "RC4")) }.doFinal(oBytes)
+    }
+
+    val id0 = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    val pValue = -4
+    md5.reset()
+    md5.update(paddedUser)
+    md5.update(oBytes)
+    md5.update(byteArrayOf(pValue.toByte(), (pValue shr 8).toByte(), (pValue shr 16).toByte(), (pValue shr 24).toByte()))
+    md5.update(id0)
+    var fileKey = md5.digest()
+    repeat(50) {
+      md5.reset()
+      md5.update(fileKey, 0, 16)
+      fileKey = md5.digest()
+    }
+
+    md5.reset()
+    md5.update(padding)
+    md5.update(id0)
+    var uHash = md5.digest()
+    for (i in 0..19) {
+      val k = ByteArray(16) { idx -> (fileKey[idx].toInt() xor i).toByte() }
+      uHash = Cipher.getInstance("RC4").apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(k, "RC4")) }.doFinal(uHash)
+    }
+    val uBytes = uHash + ByteArray(16)
+
+    // Encrypt content stream for object 4 gen 0
+    val plainStream = "BT\n/F1 12 Tf\n72 720 Td\n(Dokumen Rahasia) Tj\nET".toByteArray(Charsets.ISO_8859_1)
+    md5.reset()
+    md5.update(fileKey)
+    md5.update(byteArrayOf(4, 0, 0, 0, 0))
+    val obj4Key = md5.digest()
+    val encStream =
+      Cipher.getInstance("RC4").apply { init(Cipher.ENCRYPT_MODE, SecretKeySpec(obj4Key, "RC4")) }.doFinal(plainStream)
+
+    fun toHex(b: ByteArray) = b.joinToString("") { "%02X".format(it) }
+
+    val out = ByteArrayOutputStream()
+    out.write(
+      """
+      %PDF-1.4
+      1 0 obj
+      << /Type /Catalog /Pages 2 0 R >>
+      endobj
+      2 0 obj
+      << /Type /Pages /Kids [3 0 R] /Count 1 >>
+      endobj
+      3 0 obj
+      << /Type /Page /Parent 2 0 R /Contents 4 0 R >>
+      endobj
+      4 0 obj
+      << /Length ${encStream.size} >>
+      stream
+      """.trimIndent().toByteArray(Charsets.ISO_8859_1)
+    )
+    out.write('\n'.code)
+    out.write(encStream)
+    out.write(
+      """
+
+      endstream
+      endobj
+      5 0 obj
+      << /Filter /Standard /V 2 /R 3 /Length 128 /P $pValue /O <${toHex(oBytes)}> /U <${toHex(uBytes)}> >>
+      endobj
+      trailer
+      << /Size 6 /Root 1 0 R /Encrypt 5 0 R /ID [<${toHex(id0)}> <${toHex(id0)}>] >>
+      %%EOF
+      """.trimIndent().toByteArray(Charsets.ISO_8859_1)
+    )
+
+    val encryptedPdf = out.toByteArray()
+    assertTrue(PdfDecryptor.isEncryptedPdfBytes(encryptedPdf))
+    assertNull(PdfDecryptor.decryptBytes(encryptedPdf, "password_salah"))
+
+    val unlocked = PdfDecryptor.decryptBytes(encryptedPdf, "rahasia123")
+    assertNotNull(unlocked)
+    val extracted = PdfTextExtractor.extractFromBytes(unlocked!!, 0)
+    assertTrue(extracted.contains("Dokumen Rahasia"))
+  }
+
+  @Test
+  fun `office decryptor rejects wrong password and unlocks standard encrypted package`() {
+    val originalZip = "PK\u0003\u0004hello-office-zip".toByteArray(Charsets.UTF_8)
+    val salt = ByteArray(16) { (it + 1).toByte() }
+    val password = "buka"
+
+    val sha1 = MessageDigest.getInstance("SHA-1")
+    sha1.update(salt)
+    sha1.update(password.toByteArray(Charsets.UTF_16LE))
+    var h = sha1.digest()
+    val iterBuf = ByteArray(4)
+    for (i in 0 until 50_000) {
+      iterBuf[0] = (i and 0xFF).toByte()
+      iterBuf[1] = ((i ushr 8) and 0xFF).toByte()
+      iterBuf[2] = ((i ushr 16) and 0xFF).toByte()
+      iterBuf[3] = ((i ushr 24) and 0xFF).toByte()
+      sha1.reset()
+      sha1.update(iterBuf)
+      sha1.update(h)
+      h = sha1.digest()
+    }
+    iterBuf.fill(0)
+    sha1.reset()
+    sha1.update(h)
+    sha1.update(iterBuf)
+    val hBlock = sha1.digest()
+    val x1Buf = ByteArray(64) { 0x36 }
+    for (i in hBlock.indices) x1Buf[i] = (x1Buf[i].toInt() xor (hBlock[i].toInt() and 0xFF)).toByte()
+    val derivedKey = MessageDigest.getInstance("SHA-1").digest(x1Buf).copyOfRange(0, 16)
+
+    val encCipher = Cipher.getInstance("AES/ECB/NoPadding").apply {
+      init(Cipher.ENCRYPT_MODE, SecretKeySpec(derivedKey, "AES"))
+    }
+    val verifier = ByteArray(16) { 0x42 }
+    val encVerifier = encCipher.doFinal(verifier)
+    val verifierHashPadded = MessageDigest.getInstance("SHA-1").digest(verifier).copyOf(32)
+    val encVerifierHash = encCipher.doFinal(verifierHashPadded)
+
+    val encInfo = ByteBuffer.allocate(12 + 32 + 72).order(ByteOrder.LITTLE_ENDIAN).apply {
+      putShort(3) // versionMajor
+      putShort(2) // versionMinor
+      putInt(0) // flags
+      putInt(32) // headerSize
+      // header (32 bytes)
+      putInt(0); putInt(0); putInt(0x660E); putInt(0x8004); putInt(128); putInt(0); putInt(0); putInt(0)
+      // verifier
+      putInt(16)
+      put(salt)
+      put(encVerifier)
+      putInt(20)
+      put(encVerifierHash)
+    }.array()
+
+    val paddedZip = originalZip.copyOf(((originalZip.size + 15) / 16) * 16)
+    val encPayload = encCipher.doFinal(paddedZip)
+    val encPkg = ByteBuffer.allocate(8 + encPayload.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+      putLong(originalZip.size.toLong())
+      put(encPayload)
+    }.array()
+
+    val ole2Bytes = buildMinimalOle2WithTwoStreams("EncryptionInfo", encInfo, "EncryptedPackage", encPkg)
+    assertNull(OfficeDecryptor.decryptBytes(ole2Bytes, "salah"))
+    val unlocked = OfficeDecryptor.decryptBytes(ole2Bytes, password)
+    assertNotNull(unlocked)
+    assertArrayEquals(originalZip, unlocked)
+  }
+
+  private fun buildMinimalOle2WithTwoStreams(
+    name1: String,
+    data1: ByteArray,
+    name2: String,
+    data2: ByteArray,
+  ): ByteArray {
+    val sectorSize = 512
+    val secCount1 = ((data1.size + sectorSize - 1) / sectorSize).coerceAtLeast(1)
+    val secCount2 = ((data2.size + sectorSize - 1) / sectorSize).coerceAtLeast(1)
+    // Sector layout: 0 = FAT, 1 = Dir, 2..(2+secCount1-1) = stream1, next.. = stream2
+    val s1Start = 2
+    val s2Start = s1Start + secCount1
+    val totalSectors = s2Start + secCount2
+    val out = ByteArray((totalSectors + 1) * sectorSize)
+    val buf = ByteBuffer.wrap(out).order(ByteOrder.LITTLE_ENDIAN)
+
+    // Header
+    val magic = byteArrayOf(0xD0.toByte(), 0xCF.toByte(), 0x11.toByte(), 0xE0.toByte(), 0xA1.toByte(), 0xB1.toByte(), 0x1A.toByte(), 0xE1.toByte())
+    System.arraycopy(magic, 0, out, 0, 8)
+    buf.putShort(0x18, 0x003E)
+    buf.putShort(0x1A, 0x0003)
+    buf.putShort(0x1C, 0xFFFE.toShort())
+    buf.putShort(0x1E, 9) // 512
+    buf.putShort(0x20, 6) // 64
+    buf.putInt(0x2C, 1) // 1 FAT sector
+    buf.putInt(0x30, 1) // firstDirSector = 1
+    buf.putInt(0x38, 0) // miniStreamCutoff = 0 (always use FAT)
+    buf.putInt(0x3C, -2)
+    buf.putInt(0x44, -2)
+    for (i in 0 until 109) buf.putInt(0x4C + i * 4, if (i == 0) 0 else -1)
+
+    // FAT at sector 0 (offset 512)
+    val fatOff = 512
+    for (i in 0 until 128) buf.putInt(fatOff + i * 4, -1)
+    buf.putInt(fatOff + 0 * 4, -3) // FATSECT
+    buf.putInt(fatOff + 1 * 4, -2) // Dir END
+    for (i in 0 until secCount1) {
+      val sid = s1Start + i
+      buf.putInt(fatOff + sid * 4, if (i == secCount1 - 1) -2 else sid + 1)
+    }
+    for (i in 0 until secCount2) {
+      val sid = s2Start + i
+      buf.putInt(fatOff + sid * 4, if (i == secCount2 - 1) -2 else sid + 1)
+    }
+
+    // Directory at sector 1 (offset 1024)
+    fun writeDir(slot: Int, name: String, type: Int, startSec: Int, size: Int) {
+      val base = 1024 + slot * 128
+      val nb = name.toByteArray(Charsets.UTF_16LE)
+      System.arraycopy(nb, 0, out, base, nb.size)
+      buf.putShort(base + 64, (nb.size + 2).toShort())
+      out[base + 66] = type.toByte()
+      buf.putInt(base + 116, startSec)
+      buf.putInt(base + 120, size)
+    }
+    writeDir(0, "Root Entry", 5, -2, 0)
+    writeDir(1, name1, 2, s1Start, data1.size)
+    writeDir(2, name2, 2, s2Start, data2.size)
+
+    System.arraycopy(data1, 0, out, (s1Start + 1) * sectorSize, data1.size)
+    System.arraycopy(data2, 0, out, (s2Start + 1) * sectorSize, data2.size)
+    return out
   }
 
   private fun writeZip(file: File, entries: Map<String, String>) {

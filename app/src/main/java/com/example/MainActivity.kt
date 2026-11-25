@@ -89,6 +89,7 @@ private fun DocuViewRoot(viewModel: MainViewModel) {
         onBack = viewModel::closeViewer,
         onPickAnotherFile = launchPicker,
         onUpdateProgress = viewModel::updateProgress,
+        onSubmitPassword = viewModel::unlockWithPassword,
       )
     } else {
       HomeScreen(

@@ -118,7 +118,7 @@ fun WordViewerContent(
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
       }
-    } else if (document.blocks.size <= 500) {
+    } else if (document.blocks.size <= 30) {
       val requesters =
         remember(document.blocks) {
           List(document.blocks.size) { BringIntoViewRequester() }
@@ -191,7 +191,11 @@ fun WordViewerContent(
           if (document.isLegacyNotice) {
             item(key = "legacy_notice") { LegacyNoticeBanner() }
           }
-          itemsIndexed(items = document.blocks, key = { idx, _ -> "block_$idx" }) { blockIdx, block ->
+          itemsIndexed(
+            items = document.blocks,
+            key = { idx, _ -> "block_$idx" },
+            contentType = { _, block -> block::class },
+          ) { blockIdx, block ->
             val activeOccurrenceInBlock =
               if (activeMatch?.blockIndex == blockIdx) activeMatch.occurrenceInBlock else -1
             Surface(
@@ -388,8 +392,8 @@ private fun DocBlockView(
           3 -> 17f
           else -> 15.5f
         }
-      Text(
-        text =
+      val headingAnnotated =
+        remember(block.spans, textScale, inkColor, darkPaper, searchQuery, activeOccurrenceInBlock) {
           buildStyledAnnotatedString(
             spans = block.spans,
             textScale = textScale,
@@ -398,7 +402,10 @@ private fun DocBlockView(
             searchQuery = searchQuery,
             activeOccurrenceInBlock = activeOccurrenceInBlock,
             forceBold = true,
-          ),
+          )
+        }
+      Text(
+        text = headingAnnotated,
         fontSize = (baseSp * textScale).sp,
         lineHeight = (baseSp * 1.35f * textScale).sp,
         textAlign = block.alignment,
@@ -408,14 +415,16 @@ private fun DocBlockView(
 
     is DocBlock.Paragraph -> {
       val annotated =
-        buildStyledAnnotatedString(
-          spans = block.spans,
-          textScale = textScale,
-          defaultInk = inkColor,
-          darkPaper = darkPaper,
-          searchQuery = searchQuery,
-          activeOccurrenceInBlock = activeOccurrenceInBlock,
-        )
+        remember(block.spans, textScale, inkColor, darkPaper, searchQuery, activeOccurrenceInBlock) {
+          buildStyledAnnotatedString(
+            spans = block.spans,
+            textScale = textScale,
+            defaultInk = inkColor,
+            darkPaper = darkPaper,
+            searchQuery = searchQuery,
+            activeOccurrenceInBlock = activeOccurrenceInBlock,
+          )
+        }
       if (block.isListItem) {
         Row(modifier = Modifier.fillMaxWidth().padding(start = 8.dp)) {
           Text(

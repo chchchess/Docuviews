@@ -124,6 +124,7 @@ sealed interface ParsedDocument {
     override val file: File,
     override val fileName: String,
     val pageCount: Int,
+    val password: String? = null,
   ) : ParsedDocument {
     override val format: DocumentFormat = DocumentFormat.PDF
   }

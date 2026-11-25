@@ -4,14 +4,19 @@ import android.content.ContentResolver
 import android.content.Context
 import android.content.Intent
 import android.database.Cursor
+import android.graphics.pdf.LoadParams
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.OpenableColumns
 import com.example.data.local.RecentDocumentDao
 import com.example.data.local.RecentDocumentEntity
 import com.example.data.parser.DocBinaryParser
 import com.example.data.parser.DocxParser
+import com.example.data.parser.OfficeDecryptor
+import com.example.data.parser.Ole2CompoundReader
+import com.example.data.parser.PdfDecryptor
 import com.example.data.parser.XlsxParser
 import com.example.domain.model.DocumentFormat
 import com.example.domain.model.ParsedDocument
@@ -124,7 +129,15 @@ class DocumentRepository(
           lastPageOrSheetIndex = entity.lastPageOrSheetIndex,
         )
 
-      val parsed = parseLocalFile(targetFile, normalizedName, detectedFormat)
+      val parsed =
+        parseLocalFile(
+          docId = savedId,
+          file = targetFile,
+          displayName = normalizedName,
+          format = detectedFormat,
+          initialPageOrSheet = entity.lastPageOrSheetIndex,
+          password = null,
+        )
       recent to parsed
     }
 
@@ -136,7 +149,33 @@ class DocumentRepository(
         throw IllegalStateException("File cache tidak lagi tersedia. Silakan buka ulang file asli.")
       }
       dao.touchLastOpened(recent.id, System.currentTimeMillis())
-      parseLocalFile(file, recent.fileName, recent.format)
+      parseLocalFile(
+        docId = recent.id,
+        file = file,
+        displayName = recent.fileName,
+        format = recent.format,
+        initialPageOrSheet = recent.lastPageOrSheetIndex,
+        password = null,
+      )
+    }
+
+  suspend fun unlockDocumentWithPassword(
+    docId: Long,
+    file: File,
+    fileName: String,
+    format: DocumentFormat,
+    initialPageOrSheet: Int,
+    password: String,
+  ): ParsedDocument =
+    withContext(Dispatchers.IO) {
+      parseLocalFile(
+        docId = docId,
+        file = file,
+        displayName = fileName,
+        format = format,
+        initialPageOrSheet = initialPageOrSheet,
+        password = password,
+      )
     }
 
   suspend fun updateProgress(docId: Long, pageOrSheetIndex: Int) =
@@ -159,21 +198,186 @@ class DocumentRepository(
     }
 
   private fun parseLocalFile(
+    docId: Long,
     file: File,
     displayName: String,
     format: DocumentFormat,
+    initialPageOrSheet: Int,
+    password: String?,
   ): ParsedDocument {
     return when (format) {
-      DocumentFormat.PDF -> {
+      DocumentFormat.PDF ->
+        parsePdf(
+          docId = docId,
+          file = file,
+          displayName = displayName,
+          initialPageOrSheet = initialPageOrSheet,
+          password = password,
+        )
+
+      DocumentFormat.DOCX -> {
+        if (OfficeDecryptor.isEncryptedOoxml(file)) {
+          if (password == null) {
+            throw PasswordRequiredException(
+              docId = docId,
+              file = file,
+              fileName = displayName,
+              format = format,
+              initialPageOrSheet = initialPageOrSheet,
+              isWrongPassword = false,
+            )
+          }
+          val unlockedZip =
+            OfficeDecryptor.decryptToTempZip(file, password, context.cacheDir)
+              ?: throw PasswordRequiredException(
+                docId = docId,
+                file = file,
+                fileName = displayName,
+                format = format,
+                initialPageOrSheet = initialPageOrSheet,
+                isWrongPassword = true,
+              )
+          try {
+            DocxParser.parse(unlockedZip, displayName).copy(file = file)
+          } finally {
+            runCatching { unlockedZip.delete() }
+          }
+        } else {
+          DocxParser.parse(file, displayName)
+        }
+      }
+
+      DocumentFormat.XLSX -> {
+        if (OfficeDecryptor.isEncryptedOoxml(file)) {
+          if (password == null) {
+            throw PasswordRequiredException(
+              docId = docId,
+              file = file,
+              fileName = displayName,
+              format = format,
+              initialPageOrSheet = initialPageOrSheet,
+              isWrongPassword = false,
+            )
+          }
+          val unlockedZip =
+            OfficeDecryptor.decryptToTempZip(file, password, context.cacheDir)
+              ?: throw PasswordRequiredException(
+                docId = docId,
+                file = file,
+                fileName = displayName,
+                format = format,
+                initialPageOrSheet = initialPageOrSheet,
+                isWrongPassword = true,
+              )
+          try {
+            XlsxParser.parse(unlockedZip, displayName).copy(file = file)
+          } finally {
+            runCatching { unlockedZip.delete() }
+          }
+        } else {
+          XlsxParser.parse(file, displayName)
+        }
+      }
+
+      DocumentFormat.DOC -> DocBinaryParser.parse(file, displayName)
+    }
+  }
+
+  private fun parsePdf(
+    docId: Long,
+    file: File,
+    displayName: String,
+    initialPageOrSheet: Int,
+    password: String?,
+  ): ParsedDocument.Pdf {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+      try {
         val count =
           ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
-            PdfRenderer(pfd).use { renderer -> renderer.pageCount }
+            val renderer =
+              if (password != null) {
+                PdfRenderer(pfd, LoadParams.Builder().setPassword(password).build())
+              } else {
+                PdfRenderer(pfd)
+              }
+            renderer.use { it.pageCount }
           }
-        ParsedDocument.Pdf(file = file, fileName = displayName, pageCount = count)
+        return ParsedDocument.Pdf(
+          file = file,
+          fileName = displayName,
+          pageCount = count,
+          password = password,
+        )
+      } catch (_: SecurityException) {
+        throw PasswordRequiredException(
+          docId = docId,
+          file = file,
+          fileName = displayName,
+          format = DocumentFormat.PDF,
+          initialPageOrSheet = initialPageOrSheet,
+          isWrongPassword = password != null,
+        )
       }
-      DocumentFormat.DOCX -> DocxParser.parse(file, displayName)
-      DocumentFormat.DOC -> DocBinaryParser.parse(file, displayName)
-      DocumentFormat.XLSX -> XlsxParser.parse(file, displayName)
+    }
+
+    // Android API 24-34: decrypt encrypted PDF via PdfDecryptor before passing to PdfRenderer
+    if (PdfDecryptor.isEncryptedPdf(file)) {
+      if (password == null) {
+        throw PasswordRequiredException(
+          docId = docId,
+          file = file,
+          fileName = displayName,
+          format = DocumentFormat.PDF,
+          initialPageOrSheet = initialPageOrSheet,
+          isWrongPassword = false,
+        )
+      }
+      val unlockedTemp =
+        PdfDecryptor.decryptToTempFile(file, password, context.cacheDir)
+          ?: throw PasswordRequiredException(
+            docId = docId,
+            file = file,
+            fileName = displayName,
+            format = DocumentFormat.PDF,
+            initialPageOrSheet = initialPageOrSheet,
+            isWrongPassword = true,
+          )
+      val count =
+        try {
+          ParcelFileDescriptor.open(unlockedTemp, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+            PdfRenderer(pfd).use { it.pageCount }
+          }
+        } finally {
+          runCatching { unlockedTemp.delete() }
+        }
+      return ParsedDocument.Pdf(
+        file = file,
+        fileName = displayName,
+        pageCount = count,
+        password = password,
+      )
+    }
+
+    try {
+      val count =
+        ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { pfd ->
+          PdfRenderer(pfd).use { it.pageCount }
+        }
+      return ParsedDocument.Pdf(
+        file = file,
+        fileName = displayName,
+        pageCount = count,
+        password = password,
+      )
+    } catch (_: SecurityException) {
+      throw PasswordRequiredException(
+        docId = docId,
+        file = file,
+        fileName = displayName,
+        format = DocumentFormat.PDF,
+        initialPageOrSheet = initialPageOrSheet,
+        isWrongPassword = password != null,
+      )
     }
   }
 
@@ -186,7 +390,7 @@ class DocumentRepository(
     DocumentFormat.fromExtension(ext)?.let { return it }
     DocumentFormat.fromMimeType(mimeType)?.let { return it }
 
-    // Inspect magic bytes / ZIP entries as reliable fallback
+    // Inspect magic bytes / ZIP / OLE2 entries as reliable fallback
     val header = ByteArray(16)
     val read = file.inputStream().use { it.read(header) }
     if (read >= 4) {
@@ -208,7 +412,7 @@ class DocumentRepository(
           }
         }
       }
-      // OLE2 D0 CF 11 E0
+      // OLE2 D0 CF 11 E0: distinguish legacy .doc vs encrypted OOXML (.docx / .xlsx)
       if (
         read >= 8 &&
           header[0] == 0xD0.toByte() &&
@@ -216,6 +420,11 @@ class DocumentRepository(
           header[2] == 0x11.toByte() &&
           header[3] == 0xE0.toByte()
       ) {
+        val streams = runCatching { Ole2CompoundReader.readStreams(file.readBytes()) }.getOrNull()
+        if (streams != null && streams.containsKey("EncryptionInfo") && streams.containsKey("EncryptedPackage")) {
+          // Default to DOCX when neither extension nor MIME is present
+          return DocumentFormat.DOCX
+        }
         return DocumentFormat.DOC
       }
     }
@@ -249,3 +458,12 @@ class DocumentRepository(
 }
 
 class UnsupportedFormatException : IllegalArgumentException("Format file tidak didukung.")
+
+class PasswordRequiredException(
+  val docId: Long,
+  val file: File,
+  val fileName: String,
+  val format: DocumentFormat,
+  val initialPageOrSheet: Int,
+  val isWrongPassword: Boolean = false,
+) : Exception("Dokumen dilindungi kata sandi.")

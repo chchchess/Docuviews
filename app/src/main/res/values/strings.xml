@@ -59,4 +59,13 @@
     <string name="search_scanning">Mencari…</string>
     <string name="search_no_results">Tidak ditemukan</string>
     <string name="pdf_match_page_snippet">Halaman %1$d</string>
+    <string name="password_required_title">Dokumen Dilindungi Kata Sandi</string>
+    <string name="password_required_desc">Masukkan kata sandi untuk membuka dan membaca isi dokumen ini.</string>
+    <string name="password_field_label">Kata sandi</string>
+    <string name="password_show">Tampilkan kata sandi</string>
+    <string name="password_hide">Sembunyikan kata sandi</string>
+    <string name="password_submit">Buka Dokumen</string>
+    <string name="password_wrong_error">Kata sandi salah. Silakan periksa kembali.</string>
+    <string name="password_empty_error">Masukkan kata sandi terlebih dahulu.</string>
+    <string name="password_legacy_doc_unsupported">File .doc (Word 97-2003) yang terenkripsi tidak didukung. Simpan ulang sebagai .docx atau .pdf untuk membukanya.</string>
 </resources>
