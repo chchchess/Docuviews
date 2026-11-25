@@ -55,6 +55,7 @@ import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -62,11 +63,12 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
@@ -95,7 +97,9 @@ import com.example.data.parser.PdfRendererHelper
 import com.example.data.parser.PdfSearchHit
 import com.example.data.parser.PdfTextWord
 import com.example.domain.model.ParsedDocument
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
@@ -144,12 +148,16 @@ fun PdfViewerContent(
   val scope = rememberCoroutineScope()
 
   val currentPage by remember { derivedStateOf { listState.firstVisibleItemIndex } }
+  val isScrollingState = rememberUpdatedState(listState.isScrollInProgress)
   LaunchedEffect(currentPage) { onPageChanged(currentPage) }
 
-  // Pre-render neighboring pages quietly in background so vertical scrolling feels instant
+  // Pre-render neighboring pages only after active scrolling settles so rendering never contends with flings
   LaunchedEffect(currentPage, helper) {
-    delay(60)
-    helper.prefetchPages(currentPage)
+    snapshotFlow { isScrollingState.value }.first { !it }
+    delay(140)
+    if (!isScrollingState.value) {
+      helper.prefetchPages(currentPage)
+    }
   }
 
   var searchHits by remember { mutableStateOf<List<PdfSearchHit>>(emptyList()) }
@@ -181,7 +189,8 @@ fun PdfViewerContent(
     }
   }
 
-  val zoomScaleAnim = remember { Animatable(1f) }
+  var zoomScale by remember { mutableFloatStateOf(1f) }
+  var zoomJob by remember { mutableStateOf<Job?>(null) }
   var panOffsetX by remember { mutableFloatStateOf(0f) }
   var panOffsetY by remember { mutableFloatStateOf(0f) }
   var nightInvert by remember { mutableStateOf(false) }
@@ -189,16 +198,20 @@ fun PdfViewerContent(
 
   fun animateZoomTo(target: Float) {
     val clamped = target.coerceIn(1f, 3.5f)
-    scope.launch {
-      if (clamped <= 1.02f) {
-        panOffsetX = 0f
-        panOffsetY = 0f
+    zoomJob?.cancel()
+    zoomJob =
+      scope.launch {
+        if (clamped <= 1.02f) {
+          panOffsetX = 0f
+          panOffsetY = 0f
+        }
+        Animatable(zoomScale).animateTo(
+          targetValue = clamped,
+          animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+        ) {
+          zoomScale = value
+        }
       }
-      zoomScaleAnim.animateTo(
-        targetValue = clamped,
-        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-      )
-    }
   }
 
   val hitsByPage = remember(searchHits) { searchHits.groupBy { it.pageIndex } }
@@ -216,7 +229,7 @@ fun PdfViewerContent(
           .pointerInput(Unit) {
             detectTapGestures(
               onDoubleTap = {
-                if (zoomScaleAnim.value > 1.15f) {
+                if (zoomScale > 1.15f) {
                   animateZoomTo(1f)
                 } else {
                   animateZoomTo(2f)
@@ -230,14 +243,15 @@ fun PdfViewerContent(
               do {
                 val event = awaitPointerEvent()
                 val pressedCount = event.changes.count { it.pressed }
-                val curZoom = zoomScaleAnim.value
+                val curZoom = zoomScale
                 if (pressedCount < 2 && curZoom <= 1.02f) continue
 
                 val zoom = event.calculateZoom()
                 val pan = event.calculatePan()
                 if (zoom != 1f || (curZoom > 1.02f && pan != Offset.Zero)) {
+                  zoomJob?.cancel()
                   val nextScale = (curZoom * zoom).coerceIn(1f, 3.5f)
-                  scope.launch { zoomScaleAnim.snapTo(nextScale) }
+                  zoomScale = nextScale
                   if (nextScale > 1.02f) {
                     val maxX = size.width * (nextScale - 1f) * 0.5f
                     val maxY = size.height * (nextScale - 1f) * 0.25f
@@ -258,7 +272,7 @@ fun PdfViewerContent(
         modifier =
           Modifier.fillMaxSize()
             .graphicsLayer {
-              val s = zoomScaleAnim.value
+              val s = zoomScale
               scaleX = s
               scaleY = s
               translationX = panOffsetX
@@ -282,6 +296,7 @@ fun PdfViewerContent(
           PdfPageCard(
             helper = helper,
             pageIndex = pageIndex,
+            isScrollingState = isScrollingState,
             nightInvert = nightInvert,
             isHighlightedPage = activeHit?.pageIndex == pageIndex,
             pageSearchHits = hitsByPage[pageIndex].orEmpty(),
@@ -372,7 +387,7 @@ fun PdfViewerContent(
         }
 
         IconButton(
-          onClick = { animateZoomTo(zoomScaleAnim.value - 0.35f) },
+          onClick = { animateZoomTo(zoomScale - 0.35f) },
           modifier = Modifier.minimumInteractiveComponentSize().testTag("pdf_zoom_out"),
         ) {
           Icon(
@@ -386,13 +401,13 @@ fun PdfViewerContent(
           modifier = Modifier.testTag("pdf_zoom_reset"),
         ) {
           Text(
-            text = "${(zoomScaleAnim.value * 100).roundToInt()}%",
+            text = "${(zoomScale * 100).roundToInt()}%",
             style = MaterialTheme.typography.labelSmall,
           )
         }
 
         IconButton(
-          onClick = { animateZoomTo(zoomScaleAnim.value + 0.35f) },
+          onClick = { animateZoomTo(zoomScale + 0.35f) },
           modifier = Modifier.minimumInteractiveComponentSize().testTag("pdf_zoom_in"),
         ) {
           Icon(
@@ -472,6 +487,7 @@ fun PdfViewerContent(
 private fun PdfPageCard(
   helper: PdfRendererHelper,
   pageIndex: Int,
+  isScrollingState: State<Boolean>,
   nightInvert: Boolean,
   isHighlightedPage: Boolean,
   pageSearchHits: List<PdfSearchHit>,
@@ -485,7 +501,9 @@ private fun PdfPageCard(
 
   val wordsState by
     produceState<List<PdfTextWord>?>(initialValue = null, key1 = pageIndex, key2 = helper) {
-      delay(150)
+      snapshotFlow { isScrollingState.value }.first { !it }
+      delay(if (helper.getCachedPageWords(pageIndex) != null) 40L else 120L)
+      snapshotFlow { isScrollingState.value }.first { !it }
       value = helper.extractPageWords(pageIndex)
     }
 
@@ -493,13 +511,14 @@ private fun PdfPageCard(
   val placeholderRatio = remember(pageIndex, helper) { helper.getCachedAspectRatio(pageIndex) ?: 0.71f }
 
   Surface(
-    modifier =
-      Modifier.widthIn(max = 820.dp)
-        .fillMaxWidth()
-        .shadow(2.dp, RoundedCornerShape(8.dp)),
+    modifier = Modifier.widthIn(max = 820.dp).fillMaxWidth(),
     shape = RoundedCornerShape(8.dp),
     color = if (nightInvert) Color(0xFF121417) else Color.White,
-    border = if (isHighlightedPage) BorderStroke(2.dp, Color(0xFFFF9100)) else null,
+    border =
+      BorderStroke(
+        width = if (isHighlightedPage) 2.dp else 0.75.dp,
+        color = if (isHighlightedPage) Color(0xFFFF9100) else Color(0x1F000000),
+      ),
   ) {
     if (bmp == null) {
       Box(
@@ -518,13 +537,14 @@ private fun PdfPageCard(
       }
     } else {
       val ratio = (bmp.width.toFloat() / bmp.height.coerceAtLeast(1)).coerceIn(0.4f, 2.5f)
+      val imageBitmap = remember(bmp) { bmp.asImageBitmap() }
       PdfSelectionContainer(
         words = wordsState,
         onNoSelectableText = onNoSelectableText,
         modifier = Modifier.fillMaxWidth().aspectRatio(ratio),
       ) {
         Image(
-          bitmap = bmp.asImageBitmap(),
+          bitmap = imageBitmap,
           contentDescription = "Halaman PDF ${pageIndex + 1}",
           modifier = Modifier.fillMaxSize(),
           contentScale = ContentScale.Fit,

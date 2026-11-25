@@ -92,6 +92,20 @@ class DocumentParserTest {
   }
 
   @Test
+  fun `pdf selection segments join overlapping hyphenated tokens without dropping edges`() {
+    val words =
+      listOf(
+        PdfTextWord("5224-1200", 0.30f, 0.25f, 0.46f, 0.268f),
+        PdfTextWord("-1086-2691", 0.45f, 0.25f, 0.63f, 0.268f),
+      )
+
+    val segments = buildPdfTextSegments(words)
+    assertEquals(listOf("5224-1200-1086-2691"), segments.map { it.text })
+    assertEquals(0.30f, segments[0].left, 0.0001f)
+    assertEquals(0.63f, segments[0].right, 0.0001f)
+  }
+
+  @Test
   fun `docx parser extracts headings, styled paragraphs, and tables`() {
     val file = tempFolder.newFile("sample.docx")
     writeZip(

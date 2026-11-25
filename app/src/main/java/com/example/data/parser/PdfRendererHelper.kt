@@ -10,12 +10,15 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.util.LruCache
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.Closeable
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.coroutineContext
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 data class PdfSearchHit(
@@ -58,9 +61,12 @@ class PdfRendererHelper(
   val pageCount: Int
     get() = renderer.pageCount
 
-  // Keep rendered pages cached in memory (up to ~48 MB) for silky-smooth flinging
+  // Keep rendered pages cached in memory (up to 1/8 heap, 32-96 MB) for silky-smooth flinging
   private val cache: LruCache<Int, Bitmap> =
-    object : LruCache<Int, Bitmap>(48 * 1024 * 1024) {
+    object :
+      LruCache<Int, Bitmap>(
+        (Runtime.getRuntime().maxMemory() / 8L).toInt().coerceIn(32 * 1024 * 1024, 96 * 1024 * 1024)
+      ) {
       override fun sizeOf(key: Int, value: Bitmap): Int = value.byteCount
     }
 
@@ -70,14 +76,18 @@ class PdfRendererHelper(
 
   fun getCachedAspectRatio(pageIndex: Int): Float? = pageAspectRatioCache[pageIndex]
 
-  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1280): Bitmap? =
+  fun getCachedPageWords(pageIndex: Int): List<PdfTextWord>? = pageWordsCache[pageIndex]
+
+  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1120): Bitmap? =
     withContext(Dispatchers.IO) {
       if (pageIndex < 0 || pageIndex >= pageCount) return@withContext null
       cache.get(pageIndex)?.let { cached ->
         if (!cached.isRecycled) return@withContext cached
       }
+      coroutineContext.ensureActive()
 
       mutex.withLock {
+        coroutineContext.ensureActive()
         cache.get(pageIndex)?.let { cached ->
           if (!cached.isRecycled) return@withLock cached
         }
@@ -103,9 +113,10 @@ class PdfRendererHelper(
       }
     }
 
-  suspend fun prefetchPages(centerPage: Int, targetWidthPx: Int = 1280) {
-    val candidates = listOf(centerPage + 1, centerPage + 2, centerPage - 1)
+  suspend fun prefetchPages(centerPage: Int, targetWidthPx: Int = 1120) {
+    val candidates = listOf(centerPage + 1, centerPage - 1)
     for (idx in candidates) {
+      coroutineContext.ensureActive()
       if (idx in 0 until pageCount) {
         val existing = cache.get(idx)
         if (existing == null || existing.isRecycled) {
@@ -119,6 +130,7 @@ class PdfRendererHelper(
     withContext(Dispatchers.IO) {
       if (pageIndex < 0 || pageIndex >= pageCount) return@withContext emptyList()
       pageWordsCache[pageIndex]?.let { return@withContext it }
+      coroutineContext.ensureActive()
 
       val extracted =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
@@ -259,8 +271,10 @@ class PdfRendererHelper(
     if (rawText.isBlank() || bounds.isEmpty()) return
 
     val lines = rawText.replace("\r\n", "\n").split('\n').filter { it.isNotBlank() }
-    if (bounds.size == 1) {
-      val rect = bounds[0]
+    val lineMergedBounds = mergeSameLineRects(bounds)
+
+    if (lineMergedBounds.size == 1) {
+      val rect = lineMergedBounds[0]
       if (lines.size <= 1) {
         appendLineWordsInRect(rawText.trim(), rect, pageWidth, pageHeight, out)
       } else {
@@ -279,6 +293,13 @@ class PdfRendererHelper(
       return
     }
 
+    if (lines.size == lineMergedBounds.size) {
+      for (i in lines.indices) {
+        appendLineWordsInRect(lines[i].trim(), lineMergedBounds[i], pageWidth, pageHeight, out)
+      }
+      return
+    }
+
     if (lines.size == bounds.size) {
       for (i in lines.indices) {
         appendLineWordsInRect(lines[i].trim(), bounds[i], pageWidth, pageHeight, out)
@@ -289,7 +310,7 @@ class PdfRendererHelper(
     val tokens = rawText.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
     if (tokens.isEmpty()) return
     val totalChars = tokens.sumOf { it.length }.coerceAtLeast(1)
-    val totalBoundsWidth = bounds.sumOf { it.width().toDouble().coerceAtLeast(1.0) }.toFloat().coerceAtLeast(1f)
+    val totalBoundsWidth = lineMergedBounds.sumOf { it.width().toDouble().coerceAtLeast(1.0) }.toFloat().coerceAtLeast(1f)
 
     var charAccum = 0
     var rectIdx = 0
@@ -301,11 +322,11 @@ class PdfRendererHelper(
       val globalX0 = tokenStartFrac * totalBoundsWidth
       val globalX1 = tokenEndFrac * totalBoundsWidth
 
-      while (rectIdx < bounds.lastIndex && globalX0 > rectWidthStart + bounds[rectIdx].width()) {
-        rectWidthStart += bounds[rectIdx].width().coerceAtLeast(1f)
+      while (rectIdx < lineMergedBounds.lastIndex && globalX0 > rectWidthStart + lineMergedBounds[rectIdx].width()) {
+        rectWidthStart += lineMergedBounds[rectIdx].width().coerceAtLeast(1f)
         rectIdx++
       }
-      val rect = bounds[rectIdx]
+      val rect = lineMergedBounds[rectIdx]
       val rw = rect.width().coerceAtLeast(1f)
       val localStart = ((globalX0 - rectWidthStart) / rw).coerceIn(0f, 0.98f)
       val localEnd = ((globalX1 - rectWidthStart) / rw).coerceIn(localStart + 0.02f, 1f)
@@ -315,6 +336,29 @@ class PdfRendererHelper(
       val ny1 = (rect.bottom / pageHeight).coerceIn(ny0 + 0.005f, 1f)
       out.add(PdfTextWord(token, nx0, ny0, nx1, ny1))
     }
+  }
+
+  private fun mergeSameLineRects(bounds: List<RectF>): List<RectF> {
+    if (bounds.size <= 1) return bounds
+    val result = mutableListOf<RectF>()
+    var cur = RectF(bounds[0])
+    for (i in 1 until bounds.size) {
+      val next = bounds[i]
+      val curMidY = (cur.top + cur.bottom) * 0.5f
+      val nextMidY = (next.top + next.bottom) * 0.5f
+      val lineH = maxOf(cur.height(), next.height(), 4f)
+      val sameRow = abs(curMidY - nextMidY) <= lineH * 0.55f
+      val hGap = next.left - cur.right
+      val contiguous = hGap <= maxOf(lineH * 2.5f, 24f) && next.right >= cur.left - lineH * 0.5f
+      if (sameRow && contiguous) {
+        cur.union(next)
+      } else {
+        result.add(cur)
+        cur = RectF(next)
+      }
+    }
+    result.add(cur)
+    return result
   }
 
   private fun appendLineWordsInRect(

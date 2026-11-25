@@ -20,16 +20,44 @@ data class PdfTextWord(
  */
 object PdfTextExtractor {
 
+  private data class ParsedPdfCacheKey(
+    val path: String,
+    val length: Long,
+    val lastModified: Long,
+  )
+
+  private class ParsedPdfIndex(
+    val objects: Map<Int, PdfObject>,
+    val toUnicodeMap: Map<Int, String>,
+    val orderedPages: List<PageEntry>,
+    val fallbackStreams: List<String>,
+  )
+
+  private val docIndexLock = Any()
+  private val docIndexCache =
+    object : LinkedHashMap<ParsedPdfCacheKey, ParsedPdfIndex>(4, 0.75f, true) {
+      override fun removeEldestEntry(eldest: MutableMap.MutableEntry<ParsedPdfCacheKey, ParsedPdfIndex>?): Boolean =
+        size > 2
+    }
+
   fun extractPageText(file: File, pageIndex: Int): String {
     if (!file.exists()) return ""
-    val bytes = runCatching { file.readBytes() }.getOrNull() ?: return ""
-    return extractFromBytes(bytes, pageIndex)
+    val words = extractPageWords(file, pageIndex)
+    return if (words.isEmpty()) "" else joinWordsToReadableText(words)
   }
 
   fun extractPageWords(file: File, pageIndex: Int): List<PdfTextWord> {
-    if (!file.exists()) return emptyList()
-    val bytes = runCatching { file.readBytes() }.getOrNull() ?: return emptyList()
-    return extractPageWordsFromBytes(bytes, pageIndex)
+    if (pageIndex < 0 || !file.exists()) return emptyList()
+    val key = ParsedPdfCacheKey(file.absolutePath, file.length(), file.lastModified())
+    val index =
+      synchronized(docIndexLock) { docIndexCache[key] }
+        ?: run {
+          val bytes = runCatching { file.readBytes() }.getOrNull() ?: return emptyList()
+          val built = buildPdfIndex(bytes) ?: return emptyList()
+          synchronized(docIndexLock) { docIndexCache[key] = built }
+          built
+        }
+    return extractPageWordsFromIndex(index, pageIndex)
   }
 
   fun extractFromBytes(pdfBytes: ByteArray, pageIndex: Int): String {
@@ -62,9 +90,15 @@ object PdfTextExtractor {
 
   fun extractPageWordsFromBytes(pdfBytes: ByteArray, pageIndex: Int): List<PdfTextWord> {
     if (pageIndex < 0 || pdfBytes.isEmpty()) return emptyList()
+    val index = buildPdfIndex(pdfBytes) ?: return emptyList()
+    return extractPageWordsFromIndex(index, pageIndex)
+  }
+
+  private fun buildPdfIndex(pdfBytes: ByteArray): ParsedPdfIndex? {
+    if (pdfBytes.isEmpty()) return null
     val latin = String(pdfBytes, Charsets.ISO_8859_1)
     val objects = parseObjects(pdfBytes, latin)
-    if (objects.isEmpty()) return emptyList()
+    if (objects.isEmpty()) return null
 
     val toUnicodeMap = mutableMapOf<Int, String>()
     for (obj in objects.values) {
@@ -75,15 +109,40 @@ object PdfTextExtractor {
     }
 
     val orderedPages = resolveOrderedPageEntries(objects)
-    if (orderedPages.isNotEmpty() && pageIndex in orderedPages.indices) {
-      val pageEntry = orderedPages[pageIndex]
+    val fallbackStreams =
+      if (orderedPages.isEmpty()) {
+        objects.entries
+          .sortedBy { it.key }
+          .mapNotNull { (_, obj) ->
+            val content = obj.decompressedStreamText() ?: return@mapNotNull null
+            if (content.contains("BT") && (content.contains("Tj") || content.contains("TJ"))) {
+              content
+            } else {
+              null
+            }
+          }
+      } else {
+        emptyList()
+      }
+
+    return ParsedPdfIndex(
+      objects = objects,
+      toUnicodeMap = toUnicodeMap,
+      orderedPages = orderedPages,
+      fallbackStreams = fallbackStreams,
+    )
+  }
+
+  private fun extractPageWordsFromIndex(index: ParsedPdfIndex, pageIndex: Int): List<PdfTextWord> {
+    if (index.orderedPages.isNotEmpty() && pageIndex in index.orderedPages.indices) {
+      val pageEntry = index.orderedPages[pageIndex]
       val pageObj = pageEntry.obj
-      val mediaBox = resolveMediaBox(pageEntry.id, objects)
-      val rotate = resolveRotate(pageEntry.id, objects)
+      val mediaBox = resolveMediaBox(pageEntry.id, index.objects)
+      val rotate = resolveRotate(pageEntry.id, index.objects)
       val contentRefs = extractContentObjectRefs(pageObj.header)
       val combinedStream = StringBuilder()
       for (refId in contentRefs) {
-        val streamObj = objects[refId] ?: continue
+        val streamObj = index.objects[refId] ?: continue
         val content = streamObj.decompressedStreamText() ?: continue
         combinedStream.append(content).append('\n')
       }
@@ -91,7 +150,7 @@ object PdfTextExtractor {
         val words =
           extractWordsFromContentStream(
             content = combinedStream.toString(),
-            toUnicodeMap = toUnicodeMap,
+            toUnicodeMap = index.toUnicodeMap,
             mediaBox = mediaBox,
             rotate = rotate,
           )
@@ -99,22 +158,10 @@ object PdfTextExtractor {
       }
     }
 
-    // Fallback: collect text-bearing content streams in object order
-    val fallbackStreams =
-      objects.entries
-        .sortedBy { it.key }
-        .mapNotNull { (_, obj) ->
-          val content = obj.decompressedStreamText() ?: return@mapNotNull null
-          if (content.contains("BT") && (content.contains("Tj") || content.contains("TJ"))) {
-            content
-          } else {
-            null
-          }
-        }
-    val fallbackContent = fallbackStreams.getOrNull(pageIndex) ?: return emptyList()
+    val fallbackContent = index.fallbackStreams.getOrNull(pageIndex) ?: return emptyList()
     return extractWordsFromContentStream(
       content = fallbackContent,
-      toUnicodeMap = toUnicodeMap,
+      toUnicodeMap = index.toUnicodeMap,
       mediaBox = floatArrayOf(0f, 0f, 612f, 792f),
       rotate = 0,
     )
@@ -447,7 +494,11 @@ object PdfTextExtractor {
         val wordStart = i
         while (i < chunk.length && !chunk[i].isWhitespace()) i++
         val wordText = chunk.substring(wordStart, i)
-        val wordWidthLocal = wordText.length * fontSize * 0.52f
+        var wordAdvanceFactor = 0f
+        for (k in wordStart until i) {
+          wordAdvanceFactor += glyphAdvanceFactor(chunk[k])
+        }
+        val wordWidthLocal = wordAdvanceFactor * fontSize
 
         val trmStart = tm.mul(ctm)
         val xStart = trmStart.e
@@ -543,7 +594,7 @@ object PdfTextExtractor {
               } else {
                 if (currentWord.isEmpty()) wordStartTm = tm
                 currentWord.append(ch)
-                val charAdv = fontSize * 0.52f
+                val charAdv = fontSize * glyphAdvanceFactor(ch)
                 tm = Matrix2D(e = charAdv).mul(tm)
                 currentEndTm = tm
               }
@@ -730,6 +781,16 @@ object PdfTextExtractor {
 
     return words
   }
+
+  private fun glyphAdvanceFactor(ch: Char): Float =
+    when (ch) {
+      'M', 'W', 'm', 'w', '@', '%', '&' -> 0.72f
+      in 'A'..'Z' -> 0.62f
+      in '0'..'9', '+', '=', '#', '$' -> 0.57f
+      '-', '/', '(', ')', '[', ']', '_' -> 0.40f
+      'i', 'l', 'I', '.', ',', ':', ';', '\'', '!', 'j', 't', 'f', 'r' -> 0.31f
+      else -> 0.52f
+    }
 
   private fun applyRotation(
     left: Float,
