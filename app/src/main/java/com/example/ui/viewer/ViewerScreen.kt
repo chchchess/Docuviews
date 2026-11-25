@@ -1,9 +1,17 @@
 package com.example.ui.viewer
 
+import android.app.Activity
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,6 +19,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutoutPadding
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,6 +39,8 @@ import androidx.compose.material.icons.outlined.Search
 import androidx.compose.material.icons.outlined.Share
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material.icons.rounded.Fullscreen
+import androidx.compose.material.icons.rounded.FullscreenExit
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material3.Button
@@ -51,6 +62,7 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -63,6 +75,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -74,6 +87,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import com.example.R
 import com.example.domain.model.ParsedDocument
 import com.example.ui.ViewerState
@@ -94,16 +110,49 @@ fun ViewerScreen(
   onUpdateProgress: (docId: Long, index: Int) -> Unit,
   onSubmitPassword: (String) -> Unit,
 ) {
-  BackHandler(onBack = onBack)
-
   val context = LocalContext.current
+  val view = LocalView.current
   val snackbarHostState = remember { SnackbarHostState() }
   val scope = rememberCoroutineScope()
   var showSearchBar by remember(viewerState) { mutableStateOf(false) }
   var searchQuery by remember(viewerState) { mutableStateOf("") }
   var activeMatchIndex by remember(viewerState) { mutableIntStateOf(0) }
   var searchProgress by remember(viewerState) { mutableStateOf(SearchProgress()) }
+  var isFullScreen by remember(viewerState) { mutableStateOf(false) }
   val searchFocusRequester = remember { FocusRequester() }
+
+  val readyState = viewerState as? ViewerState.Ready
+  val doc = readyState?.document
+  val supportsTextSearch = doc != null
+  val activeFullScreen = isFullScreen && doc != null
+
+  BackHandler {
+    if (activeFullScreen) {
+      isFullScreen = false
+    } else {
+      onBack()
+    }
+  }
+
+  val activity = remember(context) { context.findActivity() }
+  DisposableEffect(activeFullScreen, view, activity) {
+    val window = activity?.window
+    val controller = if (window != null) WindowCompat.getInsetsController(window, view) else null
+    if (controller != null) {
+      if (activeFullScreen) {
+        controller.systemBarsBehavior =
+          WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        controller.hide(WindowInsetsCompat.Type.systemBars())
+      } else {
+        controller.show(WindowInsetsCompat.Type.systemBars())
+      }
+    }
+    onDispose {
+      if (activeFullScreen && controller != null) {
+        controller.show(WindowInsetsCompat.Type.systemBars())
+      }
+    }
+  }
 
   LaunchedEffect(showSearchBar) {
     if (showSearchBar) {
@@ -118,10 +167,6 @@ fun ViewerScreen(
     }
   }
 
-  val readyState = viewerState as? ViewerState.Ready
-  val doc = readyState?.document
-  val supportsTextSearch = doc != null
-
   val stepMatch: (Int) -> Unit = { delta ->
     val total = searchProgress.totalMatches
     if (total > 0) {
@@ -131,10 +176,15 @@ fun ViewerScreen(
 
   Scaffold(
     modifier = Modifier.fillMaxSize(),
-    contentWindowInsets = WindowInsets.safeDrawing,
+    contentWindowInsets = if (activeFullScreen) WindowInsets(0, 0, 0, 0) else WindowInsets.safeDrawing,
     containerColor = MaterialTheme.colorScheme.background,
     snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
     topBar = {
+      AnimatedVisibility(
+        visible = !activeFullScreen,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
+      ) {
       Column {
         TopAppBar(
           colors =
@@ -223,6 +273,15 @@ fun ViewerScreen(
             }
             if (doc != null) {
               IconButton(
+                onClick = { isFullScreen = true },
+                modifier = Modifier.minimumInteractiveComponentSize().testTag("viewer_fullscreen_toggle"),
+              ) {
+                Icon(
+                  imageVector = Icons.Rounded.Fullscreen,
+                  contentDescription = stringResource(R.string.action_fullscreen_enter),
+                )
+              }
+              IconButton(
                 onClick = { shareDocument(context, doc) },
                 modifier = Modifier.minimumInteractiveComponentSize().testTag("viewer_share_button"),
               ) {
@@ -258,6 +317,7 @@ fun ViewerScreen(
             },
           )
         }
+      }
       }
     },
   ) { innerPadding ->
@@ -356,9 +416,45 @@ fun ViewerScreen(
 
         ViewerState.Closed -> Unit
       }
+
+      AnimatedVisibility(
+        visible = activeFullScreen,
+        enter = fadeIn() + scaleIn(initialScale = 0.9f),
+        exit = fadeOut() + scaleOut(targetScale = 0.9f),
+        modifier =
+          Modifier.align(Alignment.TopEnd)
+            .displayCutoutPadding()
+            .padding(top = 12.dp, end = 12.dp),
+      ) {
+        Surface(
+          shape = RoundedCornerShape(24.dp),
+          color = MaterialTheme.colorScheme.surface.copy(alpha = 0.90f),
+          border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+          tonalElevation = 4.dp,
+          shadowElevation = 6.dp,
+        ) {
+          IconButton(
+            onClick = { isFullScreen = false },
+            modifier = Modifier.minimumInteractiveComponentSize().testTag("viewer_fullscreen_exit"),
+          ) {
+            Icon(
+              imageVector = Icons.Rounded.FullscreenExit,
+              contentDescription = stringResource(R.string.action_fullscreen_exit),
+              tint = MaterialTheme.colorScheme.onSurface,
+            )
+          }
+        }
+      }
     }
   }
 }
+
+private tailrec fun Context.findActivity(): Activity? =
+  when (this) {
+    is Activity -> this
+    is ContextWrapper -> baseContext.findActivity()
+    else -> null
+  }
 
 @Composable
 private fun PasswordPromptContent(

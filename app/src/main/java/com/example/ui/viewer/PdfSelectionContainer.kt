@@ -22,6 +22,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.PlatformTextStyle
+import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -77,6 +78,8 @@ fun PdfSelectionContainer(
   onNoSelectableText: () -> Unit,
   modifier: Modifier = Modifier,
   selectionResetKey: Int = 0,
+  isOverlayActive: Boolean = true,
+  textMeasurer: TextMeasurer? = null,
   content: @Composable BoxScope.() -> Unit,
 ) {
   val segments = remember(words) { buildPdfTextSegments(words.orEmpty()) }
@@ -98,7 +101,7 @@ fun PdfSelectionContainer(
   }
 
   val density = LocalDensity.current
-  val textMeasurer = rememberTextMeasurer()
+  val resolvedMeasurer = textMeasurer ?: rememberTextMeasurer(cacheSize = 256)
 
   CompositionLocalProvider(LocalTextSelectionColors provides PdfTextSelectionColors) {
     key(selectionResetKey) {
@@ -108,9 +111,10 @@ fun PdfSelectionContainer(
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
           content()
 
-          val pageWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
-          val pageHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-          val minHitHeightPx = with(density) { 12.dp.toPx() }
+          if (isOverlayActive) {
+            val pageWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+            val pageHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
+            val minHitHeightPx = with(density) { 12.dp.toPx() }
 
           val positionedSegments =
             remember(segments, pageWidthPx, pageHeightPx, density) {
@@ -132,7 +136,7 @@ fun PdfSelectionContainer(
                   )
 
                 val measured =
-                  textMeasurer.measure(
+                  resolvedMeasurer.measure(
                     text = seg.text,
                     style = baseStyle,
                     softWrap = false,
@@ -145,7 +149,22 @@ fun PdfSelectionContainer(
                 if (measuredW > rawW * 1.005f) {
                   val scale = (rawW / measuredW).coerceIn(0.35f, 1f)
                   finalFontSp = (baseFontSp.value * scale).coerceAtLeast(2.0f).sp
-                  finalLetterSpacing = 0.sp
+                  val scaledMeasure =
+                    resolvedMeasurer.measure(
+                      text = seg.text,
+                      style = baseStyle.copy(fontSize = finalFontSp),
+                      softWrap = false,
+                      maxLines = 1,
+                    )
+                  val scaledW = scaledMeasure.size.width.toFloat().coerceAtLeast(1f)
+                  finalLetterSpacing =
+                    if (scaledW < rawW * 0.995f && seg.text.length > 1) {
+                      val extraPx = rawW - scaledW
+                      val gaps = (seg.text.length - 1).coerceAtLeast(1)
+                      with(density) { (extraPx / gaps).coerceIn(0f, rawH * 0.25f).toSp() }
+                    } else {
+                      0.sp
+                    }
                 } else if (measuredW < rawW * 0.995f && seg.text.length > 1) {
                   finalFontSp = baseFontSp
                   val extraPx = rawW - measuredW
@@ -153,7 +172,7 @@ fun PdfSelectionContainer(
                   val perCharPx = (extraPx / gaps).coerceIn(0f, rawH * 0.40f)
                   val candidateLs = with(density) { perCharPx.toSp() }
                   val spacedMeasure =
-                    textMeasurer.measure(
+                    resolvedMeasurer.measure(
                       text = seg.text,
                       style = baseStyle.copy(letterSpacing = candidateLs),
                       softWrap = false,
@@ -214,6 +233,7 @@ fun PdfSelectionContainer(
                   .widthIn(min = minWidthDp)
                   .height(heightDp),
             )
+          }
           }
         }
       }

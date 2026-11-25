@@ -7,7 +7,10 @@ import android.graphics.Bitmap
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -18,19 +21,24 @@ import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -57,7 +65,6 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -74,7 +81,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -85,21 +91,25 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
 import androidx.compose.ui.platform.LocalTextToolbar
-import androidx.compose.ui.platform.TextToolbar
 import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextMeasurer
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.data.parser.PdfRendererHelper
@@ -110,6 +120,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 private val InvertColorFilter =
@@ -140,6 +151,7 @@ fun PdfViewerContent(
   modifier: Modifier = Modifier,
 ) {
   val context = LocalContext.current
+  val density = LocalDensity.current
   val haptic = LocalHapticFeedback.current
   val helper =
     remember(document.file.absolutePath, document.password) {
@@ -155,19 +167,15 @@ fun PdfViewerContent(
   val startIdx = initialPage.coerceIn(0, totalPages - 1)
   val listState = rememberLazyListState(initialFirstVisibleItemIndex = startIdx)
   val scope = rememberCoroutineScope()
+  val sharedTextMeasurer = rememberTextMeasurer(cacheSize = 256)
 
   val currentPage by remember { derivedStateOf { listState.firstVisibleItemIndex } }
-  val isScrollingState = rememberUpdatedState(listState.isScrollInProgress)
-  LaunchedEffect(currentPage) { onPageChanged(currentPage) }
+  val isScrolling by remember { derivedStateOf { listState.isScrollInProgress } }
+  val isScrollingState = rememberUpdatedState(isScrolling)
+  var isScrubbing by remember { mutableStateOf(false) }
+  val isScrubbingState = rememberUpdatedState(isScrubbing)
 
-  // Pre-render neighboring pages only after active scrolling settles so rendering never contends with flings
-  LaunchedEffect(currentPage, helper) {
-    snapshotFlow { isScrollingState.value }.first { !it }
-    delay(140)
-    if (!isScrollingState.value) {
-      helper.prefetchPages(currentPage)
-    }
-  }
+  LaunchedEffect(currentPage) { onPageChanged(currentPage) }
 
   var searchHits by remember { mutableStateOf<List<PdfSearchHit>>(emptyList()) }
   val trimmedQuery = searchQuery.trim()
@@ -200,136 +208,170 @@ fun PdfViewerContent(
 
   var zoomScale by remember { mutableFloatStateOf(1f) }
   var zoomJob by remember { mutableStateOf<Job?>(null) }
+  var panFlingJob by remember { mutableStateOf<Job?>(null) }
   var panOffsetX by remember { mutableFloatStateOf(0f) }
   var panOffsetY by remember { mutableFloatStateOf(0f) }
   var nightInvert by remember { mutableStateOf(false) }
   var showJumpDialog by remember { mutableStateOf(false) }
 
-  fun animateZoomTo(target: Float) {
-    val clamped = target.coerceIn(1f, 3.5f)
-    zoomJob?.cancel()
-    zoomJob =
-      scope.launch {
-        if (clamped <= 1.02f) {
-          panOffsetX = 0f
-          panOffsetY = 0f
-        }
-        Animatable(zoomScale).animateTo(
-          targetValue = clamped,
-          animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
-        ) {
-          zoomScale = value
-        }
-      }
-  }
-
   val hitsByPage = remember(searchHits) { searchHits.groupBy { it.pageIndex } }
-  val baseToolbar = LocalTextToolbar.current
+  val textToolbar = LocalTextToolbar.current
   val focusManager = LocalFocusManager.current
-  var isSelectionToolbarVisible by remember { mutableStateOf(false) }
   var selectionResetEpoch by remember { mutableIntStateOf(0) }
   var suppressDoubleTapUntil by remember { mutableLongStateOf(0L) }
 
-  val trackedToolbar =
-    remember(baseToolbar) {
-      object : TextToolbar {
-        override val status: TextToolbarStatus
-          get() = baseToolbar.status
-
-        override fun showMenu(
-          rect: Rect,
-          onCopyRequested: (() -> Unit)?,
-          onPasteRequested: (() -> Unit)?,
-          onCutRequested: (() -> Unit)?,
-          onSelectAllRequested: (() -> Unit)?,
-        ) {
-          isSelectionToolbarVisible = true
-          baseToolbar.showMenu(
-            rect = rect,
-            onCopyRequested = onCopyRequested,
-            onPasteRequested = onPasteRequested,
-            onCutRequested = onCutRequested,
-            onSelectAllRequested = onSelectAllRequested,
-          )
-        }
-
-        override fun hide() {
-          isSelectionToolbarVisible = false
-          baseToolbar.hide()
-        }
-      }
-    }
-
   fun clearActiveTextSelection() {
-    isSelectionToolbarVisible = false
-    trackedToolbar.hide()
+    textToolbar.hide()
     focusManager.clearFocus(force = true)
     selectionResetEpoch++
   }
 
-  CompositionLocalProvider(LocalTextToolbar provides trackedToolbar) {
+  // Defer mounting heavy Selectable Text nodes while flinging so scrolling never drops frames
+  val showTextOverlay by
+    produceState(initialValue = !isScrolling && !isScrubbing, key1 = isScrolling, key2 = isScrubbing) {
+      if (isScrolling || isScrubbing) {
+        value = false
+      } else {
+        delay(55L)
+        value = true
+      }
+    }
+
+  // Auto-hide fast scroll scrubber shortly after scrolling/dragging stops
+  val showScrubber by
+    produceState(initialValue = false, key1 = isScrolling, key2 = isScrubbing, key3 = totalPages) {
+      if (totalPages < 4) {
+        value = false
+      } else if (isScrolling || isScrubbing) {
+        value = true
+      } else {
+        delay(1300L)
+        value = false
+      }
+    }
+
+  BoxWithConstraints(
+    modifier =
+      modifier
+        .fillMaxSize()
+        .background(if (nightInvert) Color(0xFF0E1014) else MaterialTheme.colorScheme.surfaceVariant),
+  ) {
+    val viewportWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+    val viewportHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
+    val renderWidthPx = remember(viewportWidthPx) { (viewportWidthPx * 1.15f).roundToInt().coerceIn(720, 1440) }
+
+    // Pre-measure nearby page aspect ratios & render neighboring pages only when idle
+    LaunchedEffect(currentPage, isScrolling, isScrubbing, helper, renderWidthPx) {
+      if (isScrolling || isScrubbing) return@LaunchedEffect
+      delay(90)
+      if (!isScrollingState.value && !isScrubbing) {
+        helper.warmupPageMetrics(currentPage, radius = 8)
+        helper.prefetchPages(currentPage, renderWidthPx)
+      }
+    }
+
+    fun animateZoomTo(target: Float, focalX: Float? = null) {
+      val clamped = target.coerceIn(1f, 3.5f)
+      zoomJob?.cancel()
+      panFlingJob?.cancel()
+      val startScale = zoomScale
+      val startPanX = panOffsetX
+      val startPanY = panOffsetY
+      val targetPanX =
+        if (clamped <= 1.02f) {
+          0f
+        } else if (focalX != null && startScale <= 1.05f) {
+          val maxX = viewportWidthPx * (clamped - 1f) * 0.5f
+          ((viewportWidthPx * 0.5f - focalX) * (clamped - 1f)).coerceIn(-maxX, maxX)
+        } else {
+          val maxX = viewportWidthPx * (clamped - 1f) * 0.5f
+          startPanX.coerceIn(-maxX, maxX)
+        }
+      val targetPanY =
+        if (clamped <= 1.02f) {
+          0f
+        } else {
+          val maxY = viewportHeightPx * (clamped - 1f) * 0.5f
+          startPanY.coerceIn(-maxY, maxY)
+        }
+
+      zoomJob =
+        scope.launch {
+          Animatable(0f).animateTo(
+            targetValue = 1f,
+            animationSpec = tween(durationMillis = 200, easing = FastOutSlowInEasing),
+          ) {
+            val t = value
+            zoomScale = startScale + (clamped - startScale) * t
+            panOffsetX = startPanX + (targetPanX - startPanX) * t
+            panOffsetY = startPanY + (targetPanY - startPanY) * t
+          }
+        }
+    }
+
+    // Gesture container: 1x tap dismisses selection, double-tap zooms, pinch & zoomed-pan w/ fling
     Box(
       modifier =
-        modifier
-          .fillMaxSize()
-          .background(if (nightInvert) Color(0xFF0E1014) else MaterialTheme.colorScheme.surfaceVariant),
-    ) {
-      // Fast-path zoom/pan + tap-anywhere to cancel active text selection
-      Box(
-        modifier =
-          Modifier.fillMaxSize()
-            .pointerInput(Unit) {
-              awaitEachGesture {
-                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
-                val wasActiveOnDown =
-                  isSelectionToolbarVisible || baseToolbar.status == TextToolbarStatus.Shown
-                val startPos = down.position
-                val downTime = System.currentTimeMillis()
-                var moved = false
-                var multiTouch = false
-                while (true) {
-                  val event = awaitPointerEvent(PointerEventPass.Final)
-                  if (event.changes.size > 1) multiTouch = true
-                  val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                  if ((change.position - startPos).getDistance() > viewConfiguration.touchSlop) {
-                    moved = true
-                  }
-                  if (!change.pressed) break
+        Modifier.fillMaxSize()
+          .pointerInput(Unit) {
+            awaitEachGesture {
+              val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
+              val wasActiveOnDown = textToolbar.status == TextToolbarStatus.Shown
+              val startPos = down.position
+              val downTime = System.currentTimeMillis()
+              var moved = false
+              var multiTouch = false
+              while (true) {
+                val event = awaitPointerEvent(PointerEventPass.Final)
+                if (event.changes.size > 1) multiTouch = true
+                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                if ((change.position - startPos).getDistance() > viewConfiguration.touchSlop) {
+                  moved = true
                 }
-                if (
-                  wasActiveOnDown &&
-                    !moved &&
-                    !multiTouch &&
-                    (System.currentTimeMillis() - downTime) < 350L
-                ) {
-                  suppressDoubleTapUntil = System.currentTimeMillis() + 380L
-                  clearActiveTextSelection()
-                }
+                if (!change.pressed) break
+              }
+              if (
+                wasActiveOnDown &&
+                  !moved &&
+                  !multiTouch &&
+                  (System.currentTimeMillis() - downTime) < 280L
+              ) {
+                suppressDoubleTapUntil = System.currentTimeMillis() + 380L
+                clearActiveTextSelection()
               }
             }
-            .pointerInput(Unit) {
-              detectTapGestures(
-                onDoubleTap = {
-                  if (System.currentTimeMillis() < suppressDoubleTapUntil) return@detectTapGestures
-                  if (isSelectionToolbarVisible || baseToolbar.status == TextToolbarStatus.Shown) {
-                    clearActiveTextSelection()
-                    return@detectTapGestures
-                  }
-                  if (zoomScale > 1.15f) {
-                    animateZoomTo(1f)
-                  } else {
-                    animateZoomTo(2f)
-                  }
-                },
-              )
-            }
-            .pointerInput(Unit) {
+          }
+          .pointerInput(Unit) {
+            detectTapGestures(
+              onDoubleTap = { tapOffset ->
+                if (System.currentTimeMillis() < suppressDoubleTapUntil) return@detectTapGestures
+                if (textToolbar.status == TextToolbarStatus.Shown) {
+                  clearActiveTextSelection()
+                  return@detectTapGestures
+                }
+                if (zoomScale > 1.15f) {
+                  animateZoomTo(1f)
+                } else {
+                  animateZoomTo(2.15f, focalX = tapOffset.x)
+                }
+              },
+            )
+          }
+          .pointerInput(viewportWidthPx, viewportHeightPx) {
+            val decay = exponentialDecay<Float>(frictionMultiplier = 1.8f)
             awaitEachGesture {
               awaitFirstDown(requireUnconsumed = false)
+              panFlingJob?.cancel()
+              val velocityTracker = VelocityTracker()
+              var wasZoomedPan = false
+
               do {
                 val event = awaitPointerEvent()
-                val pressedCount = event.changes.count { it.pressed }
+                val pressedChanges = event.changes.filter { it.pressed }
+                val pressedCount = pressedChanges.size
                 val curZoom = zoomScale
+
+                // At 100% zoom with 1 finger, let LazyColumn handle scrolling natively at zero cost
                 if (pressedCount < 2 && curZoom <= 1.02f) continue
 
                 val zoom = event.calculateZoom()
@@ -339,22 +381,59 @@ fun PdfViewerContent(
                   val nextScale = (curZoom * zoom).coerceIn(1f, 3.5f)
                   zoomScale = nextScale
                   if (nextScale > 1.02f) {
-                    val maxX = size.width * (nextScale - 1f) * 0.5f
-                    val maxY = size.height * (nextScale - 1f) * 0.25f
+                    wasZoomedPan = true
+                    pressedChanges.firstOrNull()?.let { ch ->
+                      velocityTracker.addPosition(ch.uptimeMillis, ch.position)
+                    }
+                    val maxX = viewportWidthPx * (nextScale - 1f) * 0.5f
+                    val maxY = viewportHeightPx * (nextScale - 1f) * 0.5f
+
                     panOffsetX = (panOffsetX + pan.x).coerceIn(-maxX, maxX)
-                    panOffsetY = (panOffsetY + pan.y).coerceIn(-maxY, maxY)
+
+                    // Pan Y within zoomed viewport edges, then overflow seamlessly to LazyColumn scroll
+                    val rawNextY = panOffsetY + pan.y
+                    val clampedY = rawNextY.coerceIn(-maxY, maxY)
+                    val overflowY = rawNextY - clampedY
+                    panOffsetY = clampedY
+                    if (abs(overflowY) > 0.25f) {
+                      listState.dispatchRawDelta(-overflowY / nextScale)
+                    }
                   } else {
+                    wasZoomedPan = false
                     panOffsetX = 0f
                     panOffsetY = 0f
                   }
                   event.changes.forEach { it.consume() }
                 }
               } while (event.changes.any { it.pressed })
+
+              if (wasZoomedPan && zoomScale > 1.02f) {
+                val vel = velocityTracker.calculateVelocity()
+                val vx = vel.x
+                if (abs(vx) > 180f) {
+                  val startX = panOffsetX
+                  val maxX = viewportWidthPx * (zoomScale - 1f) * 0.5f
+                  panFlingJob =
+                    scope.launch {
+                      Animatable(startX).animateDecay(
+                        initialVelocity = vx,
+                        animationSpec = decay,
+                      ) {
+                        val clamped = value.coerceIn(-maxX, maxX)
+                        panOffsetX = clamped
+                        if (clamped != value) {
+                          panFlingJob?.cancel()
+                        }
+                      }
+                    }
+                }
+              }
             }
           },
     ) {
       LazyColumn(
         state = listState,
+        userScrollEnabled = !isScrubbing,
         modifier =
           Modifier.fillMaxSize()
             .graphicsLayer {
@@ -382,7 +461,11 @@ fun PdfViewerContent(
           PdfPageCard(
             helper = helper,
             pageIndex = pageIndex,
+            renderWidthPx = renderWidthPx,
             isScrollingState = isScrollingState,
+            isScrubbingState = isScrubbingState,
+            showTextOverlay = showTextOverlay || textToolbar.status == TextToolbarStatus.Shown,
+            sharedTextMeasurer = sharedTextMeasurer,
             selectionResetKey = selectionResetEpoch,
             nightInvert = nightInvert,
             isHighlightedPage = activeHit?.pageIndex == pageIndex,
@@ -394,6 +477,28 @@ fun PdfViewerContent(
             },
           )
         }
+      }
+    }
+
+    // Draggable fast-scroll page scrubber for quick navigation in large PDFs
+    if (totalPages >= 4) {
+      AnimatedVisibility(
+        visible = showScrubber,
+        enter = fadeIn(tween(150)),
+        exit = fadeOut(tween(260)),
+        modifier =
+          Modifier.align(Alignment.CenterEnd)
+            .padding(top = 64.dp, bottom = 92.dp),
+      ) {
+        PdfFastScrollScrubber(
+          currentPage = currentPage,
+          totalPages = totalPages,
+          isScrubbing = isScrubbing,
+          onScrubbingChanged = { active -> isScrubbing = active },
+          onScrubToPage = { targetPage ->
+            scope.launch { listState.scrollToItem(targetPage) }
+          },
+        )
       }
     }
 
@@ -534,7 +639,6 @@ fun PdfViewerContent(
         }
       }
     }
-    }
   }
 
   if (showJumpDialog) {
@@ -572,10 +676,107 @@ fun PdfViewerContent(
 }
 
 @Composable
+private fun PdfFastScrollScrubber(
+  currentPage: Int,
+  totalPages: Int,
+  isScrubbing: Boolean,
+  onScrubbingChanged: (Boolean) -> Unit,
+  onScrubToPage: (Int) -> Unit,
+) {
+  val density = LocalDensity.current
+  val thumbHeightDp = 44.dp
+  val maxIdx = (totalPages - 1).coerceAtLeast(1)
+
+  BoxWithConstraints(
+    modifier = Modifier.fillMaxHeight().width(120.dp),
+    contentAlignment = Alignment.TopEnd,
+  ) {
+    val trackHeightPx = with(density) { (maxHeight - thumbHeightDp).coerceAtLeast(1.dp).toPx() }
+    var dragFraction by remember { mutableFloatStateOf(currentPage.toFloat() / maxIdx) }
+    val activeFraction =
+      if (isScrubbing) {
+        dragFraction
+      } else {
+        (currentPage.toFloat() / maxIdx).coerceIn(0f, 1f)
+      }
+    val thumbOffsetPx = (activeFraction * trackHeightPx).roundToInt()
+
+    // Touch track on right edge (48dp touch width)
+    Box(
+      modifier =
+        Modifier.fillMaxHeight()
+          .width(48.dp)
+          .align(Alignment.CenterEnd)
+          .testTag("pdf_fast_scrubber")
+          .pointerInput(totalPages, trackHeightPx) {
+            detectVerticalDragGestures(
+              onDragStart = { offset ->
+                onScrubbingChanged(true)
+                val f = (offset.y / trackHeightPx).coerceIn(0f, 1f)
+                dragFraction = f
+                onScrubToPage((f * maxIdx).roundToInt().coerceIn(0, maxIdx))
+              },
+              onVerticalDrag = { change, _ ->
+                change.consume()
+                val f = (change.position.y / trackHeightPx).coerceIn(0f, 1f)
+                dragFraction = f
+                val nextPage = (f * maxIdx).roundToInt().coerceIn(0, maxIdx)
+                onScrubToPage(nextPage)
+              },
+              onDragEnd = { onScrubbingChanged(false) },
+              onDragCancel = { onScrubbingChanged(false) },
+            )
+          },
+    ) {
+      // Visual thumb
+      Surface(
+        modifier =
+          Modifier.align(Alignment.TopEnd)
+            .padding(end = 6.dp)
+            .offset { IntOffset(0, thumbOffsetPx) }
+            .width(if (isScrubbing) 8.dp else 6.dp)
+            .height(thumbHeightDp),
+        shape = RoundedCornerShape(4.dp),
+        color =
+          if (isScrubbing) {
+            MaterialTheme.colorScheme.primary
+          } else {
+            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+          },
+      ) {}
+    }
+
+    if (isScrubbing) {
+      val displayPage = (dragFraction * maxIdx).roundToInt().coerceIn(0, maxIdx) + 1
+      Surface(
+        modifier =
+          Modifier.align(Alignment.TopEnd)
+            .padding(end = 26.dp)
+            .offset { IntOffset(0, (thumbOffsetPx + 6).coerceAtLeast(0)) },
+        shape = RoundedCornerShape(14.dp),
+        color = MaterialTheme.colorScheme.inverseSurface,
+        shadowElevation = 4.dp,
+      ) {
+        Text(
+          text = "$displayPage / $totalPages",
+          style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+          color = MaterialTheme.colorScheme.inverseOnSurface,
+          modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+        )
+      }
+    }
+  }
+}
+
+@Composable
 private fun PdfPageCard(
   helper: PdfRendererHelper,
   pageIndex: Int,
+  renderWidthPx: Int,
   isScrollingState: State<Boolean>,
+  isScrubbingState: State<Boolean>,
+  showTextOverlay: Boolean,
+  sharedTextMeasurer: TextMeasurer,
   selectionResetKey: Int,
   nightInvert: Boolean,
   isHighlightedPage: Boolean,
@@ -583,21 +784,31 @@ private fun PdfPageCard(
   activeHit: PdfSearchHit?,
   onNoSelectableText: () -> Unit,
 ) {
+  val cachedBitmap = remember(pageIndex, helper) { helper.getCachedPageBitmap(pageIndex) }
   val bitmapState by
-    produceState<Bitmap?>(initialValue = null, key1 = pageIndex, key2 = helper) {
-      value = helper.renderPage(pageIndex)
+    produceState<Bitmap?>(initialValue = cachedBitmap, key1 = pageIndex, key2 = helper, key3 = renderWidthPx) {
+      if (value != null && !value!!.isRecycled) return@produceState
+      if (isScrubbingState.value) {
+        snapshotFlow { isScrubbingState.value }.first { !it }
+      }
+      if (isScrollingState.value) {
+        delay(28L)
+      }
+      value = helper.renderPage(pageIndex, renderWidthPx)
     }
 
+  val cachedWords = remember(pageIndex, helper) { helper.getCachedPageWords(pageIndex) }
   val wordsState by
-    produceState<List<PdfTextWord>?>(initialValue = null, key1 = pageIndex, key2 = helper) {
-      snapshotFlow { isScrollingState.value }.first { !it }
-      delay(if (helper.getCachedPageWords(pageIndex) != null) 40L else 120L)
-      snapshotFlow { isScrollingState.value }.first { !it }
+    produceState<List<PdfTextWord>?>(initialValue = cachedWords, key1 = pageIndex, key2 = helper) {
+      if (value != null) return@produceState
+      snapshotFlow { isScrollingState.value || isScrubbingState.value }.first { !it }
+      delay(65L)
+      snapshotFlow { isScrollingState.value || isScrubbingState.value }.first { !it }
       value = helper.extractPageWords(pageIndex)
     }
 
-  val bmp = bitmapState
-  val placeholderRatio = remember(pageIndex, helper) { helper.getCachedAspectRatio(pageIndex) ?: 0.71f }
+  val bmp = bitmapState?.takeUnless { it.isRecycled }
+  val placeholderRatio = remember(pageIndex, helper) { helper.getEstimatedAspectRatio(pageIndex) }
 
   Surface(
     modifier = Modifier.widthIn(max = 820.dp).fillMaxWidth(),
@@ -631,6 +842,8 @@ private fun PdfPageCard(
         words = wordsState,
         onNoSelectableText = onNoSelectableText,
         selectionResetKey = selectionResetKey,
+        isOverlayActive = showTextOverlay,
+        textMeasurer = sharedTextMeasurer,
         modifier = Modifier.fillMaxWidth().aspectRatio(ratio),
       ) {
         Image(

@@ -76,28 +76,59 @@ class PdfRendererHelper(
 
   fun getCachedAspectRatio(pageIndex: Int): Float? = pageAspectRatioCache[pageIndex]
 
+  fun getEstimatedAspectRatio(pageIndex: Int): Float {
+    pageAspectRatioCache[pageIndex]?.let { return it }
+    return pageAspectRatioCache[0]
+      ?: pageAspectRatioCache.values.firstOrNull()
+      ?: 0.71f
+  }
+
+  fun getCachedPageBitmap(pageIndex: Int): Bitmap? {
+    val bmp = cache.get(pageIndex) ?: return null
+    return if (bmp.isRecycled) null else bmp
+  }
+
   fun getCachedPageWords(pageIndex: Int): List<PdfTextWord>? = pageWordsCache[pageIndex]
 
-  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1120): Bitmap? =
+  suspend fun warmupPageMetrics(centerPage: Int, radius: Int = 6) {
+    withContext(Dispatchers.IO) {
+      if (pageCount <= 1) return@withContext
+      val start = (centerPage - radius).coerceAtLeast(0)
+      val end = (centerPage + radius).coerceAtMost(pageCount - 1)
+      for (idx in start..end) {
+        coroutineContext.ensureActive()
+        if (pageAspectRatioCache.containsKey(idx)) continue
+        mutex.withLock {
+          coroutineContext.ensureActive()
+          if (pageAspectRatioCache.containsKey(idx)) return@withLock
+          val page = renderer.openPage(idx)
+          try {
+            val ratio = (page.width.toFloat() / page.height.coerceAtLeast(1)).coerceIn(0.4f, 2.5f)
+            pageAspectRatioCache[idx] = ratio
+          } finally {
+            page.close()
+          }
+        }
+      }
+    }
+  }
+
+  suspend fun renderPage(pageIndex: Int, targetWidthPx: Int = 1080): Bitmap? =
     withContext(Dispatchers.IO) {
       if (pageIndex < 0 || pageIndex >= pageCount) return@withContext null
-      cache.get(pageIndex)?.let { cached ->
-        if (!cached.isRecycled) return@withContext cached
-      }
+      getCachedPageBitmap(pageIndex)?.let { return@withContext it }
       coroutineContext.ensureActive()
 
       mutex.withLock {
         coroutineContext.ensureActive()
-        cache.get(pageIndex)?.let { cached ->
-          if (!cached.isRecycled) return@withLock cached
-        }
+        getCachedPageBitmap(pageIndex)?.let { return@withLock it }
 
         val page = renderer.openPage(pageIndex)
         try {
           val ratio = (page.width.toFloat() / page.height.coerceAtLeast(1)).coerceIn(0.4f, 2.5f)
           pageAspectRatioCache[pageIndex] = ratio
 
-          val safeWidth = targetWidthPx.coerceIn(480, 2048)
+          val safeWidth = targetWidthPx.coerceIn(540, 1600)
           val scale = safeWidth.toFloat() / page.width.coerceAtLeast(1)
           val height = (page.height * scale).roundToInt().coerceIn(200, 4096)
           val bitmap = Bitmap.createBitmap(safeWidth, height, Bitmap.Config.ARGB_8888)
@@ -113,15 +144,12 @@ class PdfRendererHelper(
       }
     }
 
-  suspend fun prefetchPages(centerPage: Int, targetWidthPx: Int = 1120) {
-    val candidates = listOf(centerPage + 1, centerPage - 1)
+  suspend fun prefetchPages(centerPage: Int, targetWidthPx: Int = 1080) {
+    val candidates = listOf(centerPage + 1, centerPage + 2, centerPage - 1)
     for (idx in candidates) {
       coroutineContext.ensureActive()
-      if (idx in 0 until pageCount) {
-        val existing = cache.get(idx)
-        if (existing == null || existing.isRecycled) {
-          renderPage(idx, targetWidthPx)
-        }
+      if (idx in 0 until pageCount && getCachedPageBitmap(idx) == null) {
+        renderPage(idx, targetWidthPx)
       }
     }
   }
@@ -134,47 +162,29 @@ class PdfRendererHelper(
 
       val extracted =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-          val (pw, ph, contents) =
+          val nativeWords =
             mutex.withLock {
               coroutineContext.ensureActive()
               val page = renderer.openPage(pageIndex)
               try {
-                Triple(
-                  page.width.toFloat().coerceAtLeast(1f),
-                  page.height.toFloat().coerceAtLeast(1f),
-                  page.getTextContents().map { it.text to it.bounds },
-                )
+                val pw = page.width.toFloat().coerceAtLeast(1f)
+                val ph = page.height.toFloat().coerceAtLeast(1f)
+                val out = mutableListOf<PdfTextWord>()
+                for (content in page.getTextContents()) {
+                  appendNormalizedWordsFromContent(
+                    rawText = content.text,
+                    bounds = content.bounds,
+                    pageWidth = pw,
+                    pageHeight = ph,
+                    out = out,
+                  )
+                }
+                out.toList()
               } finally {
                 page.close()
               }
             }
-
-          val streamWords = PdfTextExtractor.extractPageWords(effectiveFile, pageIndex)
-          val nativeNonWsChars = contents.sumOf { (txt, _) -> txt.count { !it.isWhitespace() } }
-          val streamNonWsChars = streamWords.sumOf { w -> w.text.count { !it.isWhitespace() } }
-          val streamReadableChars =
-            streamWords.sumOf { w -> w.text.count { ch -> ch.code in 32..0x2FFF } }
-
-          val useExactStreamWords =
-            streamWords.isNotEmpty() &&
-              (nativeNonWsChars == 0 || streamNonWsChars >= (nativeNonWsChars * 0.72f).roundToInt()) &&
-              streamReadableChars >= (streamNonWsChars * 0.85f).roundToInt()
-
-          if (useExactStreamWords) {
-            streamWords
-          } else {
-            val out = mutableListOf<PdfTextWord>()
-            for ((rawText, bounds) in contents) {
-              appendNormalizedWordsFromContent(
-                rawText = rawText,
-                bounds = bounds,
-                pageWidth = pw,
-                pageHeight = ph,
-                out = out,
-              )
-            }
-            out.toList().ifEmpty { streamWords }
-          }
+          nativeWords.ifEmpty { PdfTextExtractor.extractPageWords(effectiveFile, pageIndex) }
         } else {
           PdfTextExtractor.extractPageWords(effectiveFile, pageIndex)
         }
@@ -290,7 +300,8 @@ class PdfRendererHelper(
     if (rawText.isBlank() || bounds.isEmpty()) return
 
     val lines = rawText.replace("\r\n", "\n").split('\n').filter { it.isNotBlank() }
-    val lineMergedBounds = mergeSameLineRects(bounds)
+    val validBounds = bounds.filter { it.width() > 0.5f && it.height() > 0.5f }.ifEmpty { bounds }
+    val lineMergedBounds = mergeSameLineRects(validBounds)
 
     if (lineMergedBounds.size == 1) {
       val rect = lineMergedBounds[0]
@@ -326,34 +337,49 @@ class PdfRendererHelper(
       return
     }
 
-    val tokens = rawText.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
-    if (tokens.isEmpty()) return
-    val totalChars = tokens.sumOf { it.length }.coerceAtLeast(1)
-    val totalBoundsWidth = lineMergedBounds.sumOf { it.width().toDouble().coerceAtLeast(1.0) }.toFloat().coerceAtLeast(1f)
+    if (lines.isEmpty()) return
 
-    var charAccum = 0
-    var rectIdx = 0
-    var rectWidthStart = 0f
-    for (token in tokens) {
-      val tokenStartFrac = charAccum.toFloat() / totalChars
-      charAccum += token.length
-      val tokenEndFrac = charAccum.toFloat() / totalChars
-      val globalX0 = tokenStartFrac * totalBoundsWidth
-      val globalX1 = tokenEndFrac * totalBoundsWidth
+    // Align lineMergedBounds 1-to-1 with \n lines without global token smearing:
+    // - If too many rects, merge the closest vertical pairs first
+    // - If too few rects, split the tallest multi-line rects proportionally
+    val rowRects = lineMergedBounds.mapTo(mutableListOf()) { RectF(it) }
 
-      while (rectIdx < lineMergedBounds.lastIndex && globalX0 > rectWidthStart + lineMergedBounds[rectIdx].width()) {
-        rectWidthStart += lineMergedBounds[rectIdx].width().coerceAtLeast(1f)
-        rectIdx++
+    while (rowRects.size > lines.size && rowRects.size > 1) {
+      var bestIdx = 0
+      var bestDist = Float.MAX_VALUE
+      for (i in 0 until rowRects.lastIndex) {
+        val aMid = (rowRects[i].top + rowRects[i].bottom) * 0.5f
+        val bMid = (rowRects[i + 1].top + rowRects[i + 1].bottom) * 0.5f
+        val d = abs(aMid - bMid)
+        if (d < bestDist) {
+          bestDist = d
+          bestIdx = i
+        }
       }
-      val rect = lineMergedBounds[rectIdx]
-      val rw = rect.width().coerceAtLeast(1f)
-      val localStart = ((globalX0 - rectWidthStart) / rw).coerceIn(0f, 0.98f)
-      val localEnd = ((globalX1 - rectWidthStart) / rw).coerceIn(localStart + 0.02f, 1f)
-      val nx0 = ((rect.left + rw * localStart) / pageWidth).coerceIn(0f, 0.992f)
-      val nx1 = ((rect.left + rw * localEnd) / pageWidth).coerceIn(nx0 + 0.005f, 1f)
-      val ny0 = (rect.top / pageHeight).coerceIn(0f, 0.992f)
-      val ny1 = (rect.bottom / pageHeight).coerceIn(ny0 + 0.005f, 1f)
-      out.add(PdfTextWord(token, nx0, ny0, nx1, ny1))
+      rowRects[bestIdx].union(rowRects[bestIdx + 1])
+      rowRects.removeAt(bestIdx + 1)
+    }
+
+    while (rowRects.size < lines.size) {
+      var tallestIdx = 0
+      var tallestH = -1f
+      for (i in rowRects.indices) {
+        val h = rowRects[i].height()
+        if (h > tallestH) {
+          tallestH = h
+          tallestIdx = i
+        }
+      }
+      val rect = rowRects[tallestIdx]
+      val midY = (rect.top + rect.bottom) * 0.5f
+      val topHalf = RectF(rect.left, rect.top, rect.right, midY)
+      val bottomHalf = RectF(rect.left, midY, rect.right, rect.bottom)
+      rowRects[tallestIdx] = topHalf
+      rowRects.add(tallestIdx + 1, bottomHalf)
+    }
+
+    for (i in lines.indices) {
+      appendLineWordsInRect(lines[i].trim(), rowRects[i], pageWidth, pageHeight, out)
     }
   }
 

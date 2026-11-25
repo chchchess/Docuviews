@@ -12,6 +12,8 @@
     <string name="action_zoom_out">Perkecil</string>
     <string name="action_zoom_reset">Reset zoom</string>
     <string name="action_toggle_dark_page">Mode baca gelap</string>
+    <string name="action_fullscreen_enter">Layar penuh</string>
+    <string name="action_fullscreen_exit">Keluar layar penuh</string>
     <string name="action_default_app_tip">Cara jadikan default</string>
     <string name="filter_all">Semua</string>
     <string name="filter_pdf">PDF</string>
