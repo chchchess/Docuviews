@@ -146,6 +146,7 @@ object PdfTextExtractor {
         val content = streamObj.decompressedStreamText() ?: continue
         combinedStream.append(content).append('\n')
       }
+      val xObjects = resolveXObjectRefs(pageEntry.id, index.objects)
       if (combinedStream.isNotEmpty()) {
         val words =
           extractWordsFromContentStream(
@@ -153,6 +154,8 @@ object PdfTextExtractor {
             toUnicodeMap = index.toUnicodeMap,
             mediaBox = mediaBox,
             rotate = rotate,
+            objects = index.objects,
+            xObjectMap = xObjects,
           )
         if (words.isNotEmpty()) return words
       }
@@ -349,6 +352,43 @@ object PdfTextExtractor {
     return listOfNotNull(singleMatch?.groupValues?.get(1)?.toIntOrNull())
   }
 
+  private fun resolveXObjectRefs(pageId: Int, objects: Map<Int, PdfObject>): Map<String, Int> {
+    val map = mutableMapOf<String, Int>()
+    var curId: Int? = pageId
+    val visited = mutableSetOf<Int>()
+    while (curId != null && visited.add(curId)) {
+      val obj = objects[curId] ?: break
+      collectXObjectsFromHeader(obj.header, objects, map)
+      curId = Regex("/Parent\\s+(\\d+)\\s+\\d+\\s+R").find(obj.header)?.groupValues?.get(1)?.toIntOrNull()
+    }
+    return map
+  }
+
+  private fun collectXObjectsFromHeader(
+    header: String,
+    objects: Map<Int, PdfObject>,
+    out: MutableMap<String, Int>,
+  ) {
+    val resHeader =
+      Regex("/Resources\\s+(\\d+)\\s+\\d+\\s+R").find(header)?.groupValues?.get(1)?.toIntOrNull()?.let { resId ->
+        objects[resId]?.header
+      } ?: header
+
+    val inlineXObj = Regex("/XObject\\s*<<(.*?)>>", RegexOption.DOT_MATCHES_ALL).find(resHeader)?.groupValues?.get(1)
+    val xObjBody =
+      inlineXObj
+        ?: Regex("/XObject\\s+(\\d+)\\s+\\d+\\s+R").find(resHeader)?.groupValues?.get(1)?.toIntOrNull()?.let { xoId ->
+          objects[xoId]?.header
+        }
+        ?: return
+
+    Regex("/([^\\s/<>\\[\\]()]+)\\s+(\\d+)\\s+\\d+\\s+R").findAll(xObjBody).forEach { m ->
+      val name = m.groupValues[1]
+      val id = m.groupValues[2].toIntOrNull() ?: return@forEach
+      if (!out.containsKey(name)) out[name] = id
+    }
+  }
+
   private fun inflateBytes(compressed: ByteArray): ByteArray? {
     return runCatching {
       val inflater = Inflater()
@@ -457,17 +497,25 @@ object PdfTextExtractor {
     toUnicodeMap: Map<Int, String>,
     mediaBox: FloatArray,
     rotate: Int,
+    objects: Map<Int, PdfObject> = emptyMap(),
+    xObjectMap: Map<String, Int> = emptyMap(),
+    initialCtm: Matrix2D = Matrix2D(),
+    xObjectDepth: Int = 0,
   ): List<PdfTextWord> {
     val words = mutableListOf<PdfTextWord>()
     val ctmStack = ArrayDeque<Matrix2D>()
-    var ctm = Matrix2D()
+    var ctm = initialCtm
     var tm = Matrix2D()
     var tlm = Matrix2D()
     var leading = 14f
     var fontSize = 12f
+    var charSpacing = 0f
+    var wordSpacing = 0f
+    var horizScale = 1f
     var inTextBlock = false
 
     val numericOperands = ArrayList<Float>(8)
+    var lastPdfName: String? = null
     var pendingString: String? = null
     var pendingArray: List<TjElement>? = null
 
@@ -487,24 +535,23 @@ object PdfTextExtractor {
             spaceCount++
             i++
           }
-          val spaceAdv = spaceCount * fontSize * 0.28f
+          val spaceAdv = spaceCount * (fontSize * 0.28f + charSpacing + wordSpacing) * horizScale
           tm = Matrix2D(e = spaceAdv).mul(tm)
           continue
         }
         val wordStart = i
         while (i < chunk.length && !chunk[i].isWhitespace()) i++
         val wordText = chunk.substring(wordStart, i)
-        var wordAdvanceFactor = 0f
+        var wordAdvance = 0f
         for (k in wordStart until i) {
-          wordAdvanceFactor += glyphAdvanceFactor(chunk[k])
+          wordAdvance += (glyphAdvanceFactor(chunk[k]) * fontSize + charSpacing) * horizScale
         }
-        val wordWidthLocal = wordAdvanceFactor * fontSize
 
         val trmStart = tm.mul(ctm)
         val xStart = trmStart.e
         val yBase = trmStart.f
 
-        val tmAfter = Matrix2D(e = wordWidthLocal).mul(tm)
+        val tmAfter = Matrix2D(e = wordAdvance).mul(tm)
         val trmEnd = tmAfter.mul(ctm)
         val xEnd = trmEnd.e
 
@@ -572,7 +619,7 @@ object PdfTextExtractor {
       for (el in elements) {
         when (el) {
           is TjElement.Kern -> {
-            val dx = (-el.amount / 1000f) * fontSize
+            val dx = (-el.amount / 1000f) * fontSize * horizScale
             if (el.amount <= -180f) {
               flushBufferedWord()
               tm = Matrix2D(e = dx).mul(tm)
@@ -587,14 +634,14 @@ object PdfTextExtractor {
             for (ch in el.value) {
               if (ch.isWhitespace()) {
                 flushBufferedWord()
-                val spaceAdv = fontSize * 0.28f
+                val spaceAdv = (fontSize * 0.28f + charSpacing + wordSpacing) * horizScale
                 tm = Matrix2D(e = spaceAdv).mul(tm)
                 wordStartTm = tm
                 currentEndTm = tm
               } else {
                 if (currentWord.isEmpty()) wordStartTm = tm
                 currentWord.append(ch)
-                val charAdv = fontSize * glyphAdvanceFactor(ch)
+                val charAdv = (fontSize * glyphAdvanceFactor(ch) + charSpacing) * horizScale
                 tm = Matrix2D(e = charAdv).mul(tm)
                 currentEndTm = tm
               }
@@ -641,9 +688,10 @@ object PdfTextExtractor {
           i = parsed.second
         }
         c == '/' -> {
-          // PDF name token like /F1; skip name characters
+          val nameStart = i + 1
           i++
           while (i < len && !content[i].isWhitespace() && content[i] !in "()<>[]{}/%") i++
+          lastPdfName = content.substring(nameStart, i)
         }
         c == '-' || c == '+' || c == '.' || c.isDigit() -> {
           val start = i
@@ -684,6 +732,51 @@ object PdfTextExtractor {
               }
               numericOperands.clear()
             }
+            "Do" -> {
+              val xoId = lastPdfName?.let { xObjectMap[it] }
+              val xoObj = xoId?.let { objects[it] }
+              if (xoObj != null && xObjectDepth < 4 && xoObj.header.contains("/Form")) {
+                val xoStream = xoObj.decompressedStreamText()
+                if (!xoStream.isNullOrBlank()) {
+                  val matrixNums =
+                    Regex("/Matrix\\s*\\[([^\\]]+)]")
+                      .find(xoObj.header)
+                      ?.groupValues
+                      ?.get(1)
+                      ?.trim()
+                      ?.split(Regex("\\s+"))
+                      ?.mapNotNull { it.toFloatOrNull() }
+                  val formMatrix =
+                    if (matrixNums != null && matrixNums.size >= 6) {
+                      Matrix2D(
+                        matrixNums[0],
+                        matrixNums[1],
+                        matrixNums[2],
+                        matrixNums[3],
+                        matrixNums[4],
+                        matrixNums[5],
+                      ).mul(ctm)
+                    } else {
+                      ctm
+                    }
+                  val nestedMap = xObjectMap.toMutableMap()
+                  collectXObjectsFromHeader(xoObj.header, objects, nestedMap)
+                  words.addAll(
+                    extractWordsFromContentStream(
+                      content = xoStream,
+                      toUnicodeMap = toUnicodeMap,
+                      mediaBox = mediaBox,
+                      rotate = rotate,
+                      objects = objects,
+                      xObjectMap = nestedMap,
+                      initialCtm = formMatrix,
+                      xObjectDepth = xObjectDepth + 1,
+                    )
+                  )
+                }
+              }
+              numericOperands.clear()
+            }
             "BT" -> {
               inTextBlock = true
               tm = Matrix2D()
@@ -692,6 +785,18 @@ object PdfTextExtractor {
             }
             "ET" -> {
               inTextBlock = false
+              numericOperands.clear()
+            }
+            "Tc" -> {
+              numericOperands.lastOrNull()?.let { charSpacing = it }
+              numericOperands.clear()
+            }
+            "Tw" -> {
+              numericOperands.lastOrNull()?.let { wordSpacing = it }
+              numericOperands.clear()
+            }
+            "Tz" -> {
+              numericOperands.lastOrNull()?.let { if (it > 1f) horizScale = it / 100f }
               numericOperands.clear()
             }
             "TL" -> {
@@ -782,14 +887,14 @@ object PdfTextExtractor {
     return words
   }
 
-  private fun glyphAdvanceFactor(ch: Char): Float =
+  internal fun glyphAdvanceFactor(ch: Char): Float =
     when (ch) {
-      'M', 'W', 'm', 'w', '@', '%', '&' -> 0.72f
-      in 'A'..'Z' -> 0.62f
+      'M', 'W', 'm', 'w', '@', '%', '&' -> 0.84f
+      in 'A'..'Z' -> if (ch == 'I' || ch == 'J') 0.34f else 0.68f
       in '0'..'9', '+', '=', '#', '$' -> 0.57f
-      '-', '/', '(', ')', '[', ']', '_' -> 0.40f
-      'i', 'l', 'I', '.', ',', ':', ';', '\'', '!', 'j', 't', 'f', 'r' -> 0.31f
-      else -> 0.52f
+      'i', 'l', '.', ',', ':', ';', '\'', '!', '|' -> 0.28f
+      '-', '/', '(', ')', '[', ']', '_', 'f', 'j', 't', 'r' -> 0.35f
+      else -> 0.56f
     }
 
   private fun applyRotation(

@@ -134,28 +134,47 @@ class PdfRendererHelper(
 
       val extracted =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-          val nativeWords =
+          val (pw, ph, contents) =
             mutex.withLock {
+              coroutineContext.ensureActive()
               val page = renderer.openPage(pageIndex)
               try {
-                val pw = page.width.toFloat().coerceAtLeast(1f)
-                val ph = page.height.toFloat().coerceAtLeast(1f)
-                val out = mutableListOf<PdfTextWord>()
-                for (content in page.getTextContents()) {
-                  appendNormalizedWordsFromContent(
-                    rawText = content.text,
-                    bounds = content.bounds,
-                    pageWidth = pw,
-                    pageHeight = ph,
-                    out = out,
-                  )
-                }
-                out.toList()
+                Triple(
+                  page.width.toFloat().coerceAtLeast(1f),
+                  page.height.toFloat().coerceAtLeast(1f),
+                  page.getTextContents().map { it.text to it.bounds },
+                )
               } finally {
                 page.close()
               }
             }
-          nativeWords.ifEmpty { PdfTextExtractor.extractPageWords(effectiveFile, pageIndex) }
+
+          val streamWords = PdfTextExtractor.extractPageWords(effectiveFile, pageIndex)
+          val nativeNonWsChars = contents.sumOf { (txt, _) -> txt.count { !it.isWhitespace() } }
+          val streamNonWsChars = streamWords.sumOf { w -> w.text.count { !it.isWhitespace() } }
+          val streamReadableChars =
+            streamWords.sumOf { w -> w.text.count { ch -> ch.code in 32..0x2FFF } }
+
+          val useExactStreamWords =
+            streamWords.isNotEmpty() &&
+              (nativeNonWsChars == 0 || streamNonWsChars >= (nativeNonWsChars * 0.72f).roundToInt()) &&
+              streamReadableChars >= (streamNonWsChars * 0.85f).roundToInt()
+
+          if (useExactStreamWords) {
+            streamWords
+          } else {
+            val out = mutableListOf<PdfTextWord>()
+            for ((rawText, bounds) in contents) {
+              appendNormalizedWordsFromContent(
+                rawText = rawText,
+                bounds = bounds,
+                pageWidth = pw,
+                pageHeight = ph,
+                out = out,
+              )
+            }
+            out.toList().ifEmpty { streamWords }
+          }
         } else {
           PdfTextExtractor.extractPageWords(effectiveFile, pageIndex)
         }
@@ -369,15 +388,24 @@ class PdfRendererHelper(
     out: MutableList<PdfTextWord>,
   ) {
     if (line.isBlank()) return
-    val totalLen = line.length.coerceAtLeast(1).toFloat()
+    val cumWeights = FloatArray(line.length + 1)
+    var totalWeight = 0f
+    for (idx in line.indices) {
+      val ch = line[idx]
+      val w = if (ch.isWhitespace()) 0.28f else PdfTextExtractor.glyphAdvanceFactor(ch)
+      totalWeight += w
+      cumWeights[idx + 1] = totalWeight
+    }
+    if (totalWeight <= 0f) totalWeight = 1f
+
     val rw = rect.width().coerceAtLeast(1f)
     val ny0 = (rect.top / pageHeight).coerceIn(0f, 0.992f)
     val ny1 = (rect.bottom / pageHeight).coerceIn(ny0 + 0.005f, 1f)
 
     val wordRegex = Regex("\\S+")
     for (match in wordRegex.findAll(line)) {
-      val startFrac = match.range.first / totalLen
-      val endFrac = (match.range.last + 1) / totalLen
+      val startFrac = cumWeights[match.range.first] / totalWeight
+      val endFrac = cumWeights[match.range.last + 1] / totalWeight
       val nx0 = ((rect.left + rw * startFrac) / pageWidth).coerceIn(0f, 0.992f)
       val nx1 = ((rect.left + rw * endFrac) / pageWidth).coerceIn(nx0 + 0.005f, 1f)
       out.add(PdfTextWord(match.value, nx0, ny0, nx1, ny1))

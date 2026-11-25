@@ -106,6 +106,26 @@ class DocumentParserTest {
   }
 
   @Test
+  fun `pdf selection segments preserve staggered multi-column lines in reading order`() {
+    val words =
+      listOf(
+        PdfTextWord("Missing", 0.08f, 0.310f, 0.14f, 0.322f),
+        PdfTextWord("Data", 0.145f, 0.310f, 0.19f, 0.322f),
+        PdfTextWord("Prior", 0.76f, 0.324f, 0.80f, 0.336f),
+        PdfTextWord("Year", 0.805f, 0.324f, 0.84f, 0.336f),
+        PdfTextWord("Data", 0.845f, 0.324f, 0.88f, 0.336f),
+        PdfTextWord("Transmittal", 0.08f, 0.295f, 0.16f, 0.307f),
+        PdfTextWord("Letter", 0.165f, 0.295f, 0.22f, 0.307f),
+      )
+
+    val segments = buildPdfTextSegments(words)
+    assertEquals(
+      listOf("Transmittal Letter", "Missing Data", "Prior Year Data"),
+      segments.map { it.text },
+    )
+  }
+
+  @Test
   fun `docx parser extracts headings, styled paragraphs, and tables`() {
     val file = tempFolder.newFile("sample.docx")
     writeZip(

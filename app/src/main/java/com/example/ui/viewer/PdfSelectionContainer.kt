@@ -14,6 +14,7 @@ import androidx.compose.foundation.text.selection.TextSelectionColors
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -68,13 +69,14 @@ private val PdfOverlayLineHeightStyle =
  * Custom SelectionContainer wrapper tailored for rendered PDF pages.
  * Keeps the visual PDF Bitmap visible while overlaying transparent, coordinate-aligned
  * Selectable Text segments inside Jetpack Compose's SelectionContainer so users can
- * long-press, drag handles cleanly to exact start/end edges, and copy text natively.
+ * long-press, drag handles cleanly to exact start/end edges, and dismiss cleanly on tap.
  */
 @Composable
 fun PdfSelectionContainer(
   words: List<PdfTextWord>?,
   onNoSelectableText: () -> Unit,
   modifier: Modifier = Modifier,
+  selectionResetKey: Int = 0,
   content: @Composable BoxScope.() -> Unit,
 ) {
   val segments = remember(words) { buildPdfTextSegments(words.orEmpty()) }
@@ -99,118 +101,120 @@ fun PdfSelectionContainer(
   val textMeasurer = rememberTextMeasurer()
 
   CompositionLocalProvider(LocalTextSelectionColors provides PdfTextSelectionColors) {
-    SelectionContainer(
-      modifier = modifier.testTag("pdf_selection_container"),
-    ) {
-      BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        content()
+    key(selectionResetKey) {
+      SelectionContainer(
+        modifier = modifier.testTag("pdf_selection_container"),
+      ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+          content()
 
-        val pageWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
-        val pageHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-        val minHitHeightPx = with(density) { 12.dp.toPx() }
+          val pageWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
+          val pageHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
+          val minHitHeightPx = with(density) { 12.dp.toPx() }
 
-        val positionedSegments =
-          remember(segments, pageWidthPx, pageHeightPx, density) {
-            segments.map { seg ->
-              val rawW = ((seg.right - seg.left) * pageWidthPx).coerceAtLeast(8f)
-              val rawH = ((seg.bottom - seg.top) * pageHeightPx).coerceAtLeast(6f)
-              val renderH = maxOf(rawH, minHitHeightPx)
-              val baseFontSp = with(density) { (rawH * 0.80f).coerceAtLeast(4f).toSp() }
-              val lineHeightSp = with(density) { renderH.toSp() }
+          val positionedSegments =
+            remember(segments, pageWidthPx, pageHeightPx, density) {
+              segments.map { seg ->
+                val rawW = ((seg.right - seg.left) * pageWidthPx).coerceAtLeast(8f)
+                val rawH = ((seg.bottom - seg.top) * pageHeightPx).coerceAtLeast(6f)
+                val renderH = maxOf(rawH, minHitHeightPx)
+                val baseFontSp = with(density) { (rawH * 0.80f).coerceAtLeast(4f).toSp() }
+                val lineHeightSp = with(density) { renderH.toSp() }
 
-              val baseStyle =
-                TextStyle(
-                  fontFamily = FontFamily.SansSerif,
-                  fontWeight = FontWeight.Normal,
-                  fontSize = baseFontSp,
-                  lineHeight = lineHeightSp,
-                  platformStyle = PlatformTextStyle(includeFontPadding = false),
-                  lineHeightStyle = PdfOverlayLineHeightStyle,
-                )
+                val baseStyle =
+                  TextStyle(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.Normal,
+                    fontSize = baseFontSp,
+                    lineHeight = lineHeightSp,
+                    platformStyle = PlatformTextStyle(includeFontPadding = false),
+                    lineHeightStyle = PdfOverlayLineHeightStyle,
+                  )
 
-              val measured =
-                textMeasurer.measure(
-                  text = seg.text,
-                  style = baseStyle,
-                  softWrap = false,
-                  maxLines = 1,
-                )
-              val measuredW = measured.size.width.toFloat().coerceAtLeast(1f)
-
-              val finalFontSp: TextUnit
-              val finalLetterSpacing: TextUnit
-              if (measuredW > rawW * 0.99f) {
-                val scale = ((rawW * 0.99f) / measuredW).coerceIn(0.35f, 1f)
-                finalFontSp = (baseFontSp.value * scale).coerceAtLeast(3.5f).sp
-                finalLetterSpacing = 0.sp
-              } else if (measuredW < rawW * 0.96f && seg.text.length > 1) {
-                finalFontSp = baseFontSp
-                val extraPx = rawW - measuredW
-                val gaps = (seg.text.length - 1).coerceAtLeast(1)
-                val perCharPx = (extraPx / gaps).coerceIn(0f, rawH * 0.35f)
-                val candidateLs = with(density) { perCharPx.toSp() }
-                val spacedMeasure =
+                val measured =
                   textMeasurer.measure(
                     text = seg.text,
-                    style = baseStyle.copy(letterSpacing = candidateLs),
+                    style = baseStyle,
                     softWrap = false,
                     maxLines = 1,
                   )
-                val spacedW = spacedMeasure.size.width.toFloat()
-                finalLetterSpacing =
-                  if (spacedW > rawW && spacedW > measuredW) {
-                    val ratio = ((rawW - measuredW) / (spacedW - measuredW)).coerceIn(0f, 1f)
-                    (candidateLs.value * ratio).sp
-                  } else {
-                    candidateLs
-                  }
-              } else {
-                finalFontSp = baseFontSp
-                finalLetterSpacing = 0.sp
-              }
+                val measuredW = measured.size.width.toFloat().coerceAtLeast(1f)
 
-              val finalStyle =
-                baseStyle.copy(
-                  fontSize = finalFontSp,
-                  letterSpacing = finalLetterSpacing,
+                val finalFontSp: TextUnit
+                val finalLetterSpacing: TextUnit
+                if (measuredW > rawW * 1.005f) {
+                  val scale = (rawW / measuredW).coerceIn(0.35f, 1f)
+                  finalFontSp = (baseFontSp.value * scale).coerceAtLeast(2.0f).sp
+                  finalLetterSpacing = 0.sp
+                } else if (measuredW < rawW * 0.995f && seg.text.length > 1) {
+                  finalFontSp = baseFontSp
+                  val extraPx = rawW - measuredW
+                  val gaps = (seg.text.length - 1).coerceAtLeast(1)
+                  val perCharPx = (extraPx / gaps).coerceIn(0f, rawH * 0.40f)
+                  val candidateLs = with(density) { perCharPx.toSp() }
+                  val spacedMeasure =
+                    textMeasurer.measure(
+                      text = seg.text,
+                      style = baseStyle.copy(letterSpacing = candidateLs),
+                      softWrap = false,
+                      maxLines = 1,
+                    )
+                  val spacedW = spacedMeasure.size.width.toFloat()
+                  finalLetterSpacing =
+                    if (spacedW > rawW && spacedW > measuredW) {
+                      val ratio = ((rawW - measuredW) / (spacedW - measuredW)).coerceIn(0f, 1f)
+                      (candidateLs.value * ratio).sp
+                    } else {
+                      candidateLs
+                    }
+                } else {
+                  finalFontSp = baseFontSp
+                  finalLetterSpacing = 0.sp
+                }
+
+                val finalStyle =
+                  baseStyle.copy(
+                    fontSize = finalFontSp,
+                    letterSpacing = finalLetterSpacing,
+                  )
+
+                val xPx =
+                  (seg.left * pageWidthPx)
+                    .roundToInt()
+                    .coerceIn(0, (pageWidthPx - 4f).roundToInt().coerceAtLeast(0))
+                val centerY = ((seg.top + seg.bottom) * 0.5f) * pageHeightPx
+                val yPx =
+                  (centerY - renderH * 0.5f)
+                    .roundToInt()
+                    .coerceIn(0, (pageHeightPx - renderH).roundToInt().coerceAtLeast(0))
+
+                PositionedPdfSegment(
+                  text = seg.text,
+                  xPx = xPx,
+                  yPx = yPx,
+                  minWidthPx = rawW,
+                  heightPx = renderH,
+                  textStyle = finalStyle,
                 )
-
-              val xPx =
-                (seg.left * pageWidthPx)
-                  .roundToInt()
-                  .coerceIn(0, (pageWidthPx - 4f).roundToInt().coerceAtLeast(0))
-              val centerY = ((seg.top + seg.bottom) * 0.5f) * pageHeightPx
-              val yPx =
-                (centerY - renderH * 0.5f)
-                  .roundToInt()
-                  .coerceIn(0, (pageHeightPx - renderH).roundToInt().coerceAtLeast(0))
-
-              PositionedPdfSegment(
-                text = seg.text,
-                xPx = xPx,
-                yPx = yPx,
-                minWidthPx = rawW,
-                heightPx = renderH,
-                textStyle = finalStyle,
-              )
+              }
             }
-          }
 
-        for (seg in positionedSegments) {
-          val minWidthDp = with(density) { seg.minWidthPx.toDp() }.coerceAtLeast(4.dp)
-          val heightDp = with(density) { seg.heightPx.toDp() }.coerceAtLeast(8.dp)
-          Text(
-            text = seg.text,
-            color = Color.Transparent,
-            style = seg.textStyle,
-            softWrap = false,
-            maxLines = 1,
-            overflow = TextOverflow.Visible,
-            modifier =
-              Modifier.offset { IntOffset(seg.xPx, seg.yPx) }
-                .widthIn(min = minWidthDp)
-                .height(heightDp),
-          )
+          for (seg in positionedSegments) {
+            val minWidthDp = with(density) { seg.minWidthPx.toDp() }.coerceAtLeast(4.dp)
+            val heightDp = with(density) { seg.heightPx.toDp() }.coerceAtLeast(8.dp)
+            Text(
+              text = seg.text,
+              color = Color.Transparent,
+              style = seg.textStyle,
+              softWrap = false,
+              maxLines = 1,
+              overflow = TextOverflow.Visible,
+              modifier =
+                Modifier.offset { IntOffset(seg.xPx, seg.yPx) }
+                  .widthIn(min = minWidthDp)
+                  .height(heightDp),
+            )
+          }
         }
       }
     }
@@ -218,34 +222,56 @@ fun PdfSelectionContainer(
 }
 
 /**
- * Groups normalized PDF words into contiguous same-line segments while preserving column
- * boundaries so multi-column PDFs and tables select cleanly column-by-column.
+ * Groups normalized PDF words into contiguous same-line segments using a strictly transitive
+ * vertical row-clustering pass while preserving column boundaries.
  */
 internal fun buildPdfTextSegments(words: List<PdfTextWord>): List<PdfTextSegment> {
   if (words.isEmpty()) return emptyList()
 
-  // Sort roughly by vertical band then horizontal position to guarantee geometric reading order
-  val sorted =
-    words.sortedWith { a, b ->
-      val aMidY = (a.top + a.bottom) * 0.5f
-      val bMidY = (b.top + b.bottom) * 0.5f
-      val lineH = maxOf(a.bottom - a.top, b.bottom - b.top, 0.01f)
-      if (abs(aMidY - bMidY) <= lineH * 0.5f) {
-        a.left.compareTo(b.left)
+  // Step 1: Strictly transitive vertical sort first, then horizontal tiebreak
+  val byVertical =
+    words.sortedWith(
+      compareBy<PdfTextWord> { (it.top + it.bottom) * 0.5f }.thenBy { it.left }
+    )
+
+  // Step 2: Cluster into visual horizontal rows and sort each row strictly by left edge
+  val ordered = ArrayList<PdfTextWord>(byVertical.size)
+  var rowStart = 0
+  while (rowStart < byVertical.size) {
+    val anchor = byVertical[rowStart]
+    val anchorMidY = (anchor.top + anchor.bottom) * 0.5f
+    var rowMaxH = (anchor.bottom - anchor.top).coerceAtLeast(0.01f)
+    var rowEnd = rowStart + 1
+    while (rowEnd < byVertical.size) {
+      val cand = byVertical[rowEnd]
+      val candMidY = (cand.top + cand.bottom) * 0.5f
+      val candH = (cand.bottom - cand.top).coerceAtLeast(0.01f)
+      val bandH = maxOf(rowMaxH, candH)
+      if (abs(candMidY - anchorMidY) <= maxOf(bandH * 0.52f, 0.006f)) {
+        rowMaxH = bandH
+        rowEnd++
       } else {
-        aMidY.compareTo(bMidY)
+        break
       }
     }
+    if (rowEnd - rowStart > 1) {
+      val rowSlice = byVertical.subList(rowStart, rowEnd).sortedBy { it.left }
+      ordered.addAll(rowSlice)
+    } else {
+      ordered.add(anchor)
+    }
+    rowStart = rowEnd
+  }
 
   val segments = mutableListOf<PdfTextSegment>()
-  val buffer = StringBuilder(sorted[0].text)
-  var curLeft = sorted[0].left
-  var curTop = sorted[0].top
-  var curRight = sorted[0].right
-  var curBottom = sorted[0].bottom
+  val buffer = StringBuilder(ordered[0].text)
+  var curLeft = ordered[0].left
+  var curTop = ordered[0].top
+  var curRight = ordered[0].right
+  var curBottom = ordered[0].bottom
 
-  for (i in 1 until sorted.size) {
-    val next = sorted[i]
+  for (i in 1 until ordered.size) {
+    val next = ordered[i]
     val curMidY = (curTop + curBottom) * 0.5f
     val nextMidY = (next.top + next.bottom) * 0.5f
     val lineH = maxOf(curBottom - curTop, next.bottom - next.top, 0.01f)

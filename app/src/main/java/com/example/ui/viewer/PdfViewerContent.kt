@@ -57,8 +57,11 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -71,6 +74,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ColorFilter
@@ -79,10 +83,15 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.platform.LocalTextToolbar
+import androidx.compose.ui.platform.TextToolbar
+import androidx.compose.ui.platform.TextToolbarStatus
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
@@ -215,29 +224,106 @@ fun PdfViewerContent(
   }
 
   val hitsByPage = remember(searchHits) { searchHits.groupBy { it.pageIndex } }
+  val baseToolbar = LocalTextToolbar.current
+  val focusManager = LocalFocusManager.current
+  var isSelectionToolbarVisible by remember { mutableStateOf(false) }
+  var selectionResetEpoch by remember { mutableIntStateOf(0) }
+  var suppressDoubleTapUntil by remember { mutableLongStateOf(0L) }
 
-  Box(
-    modifier =
-      modifier
-        .fillMaxSize()
-        .background(if (nightInvert) Color(0xFF0E1014) else MaterialTheme.colorScheme.surfaceVariant),
-  ) {
-    // Fast-path zoom/pan: zero math overhead on single-finger 1x vertical flings + smooth double-tap zoom
+  val trackedToolbar =
+    remember(baseToolbar) {
+      object : TextToolbar {
+        override val status: TextToolbarStatus
+          get() = baseToolbar.status
+
+        override fun showMenu(
+          rect: Rect,
+          onCopyRequested: (() -> Unit)?,
+          onPasteRequested: (() -> Unit)?,
+          onCutRequested: (() -> Unit)?,
+          onSelectAllRequested: (() -> Unit)?,
+        ) {
+          isSelectionToolbarVisible = true
+          baseToolbar.showMenu(
+            rect = rect,
+            onCopyRequested = onCopyRequested,
+            onPasteRequested = onPasteRequested,
+            onCutRequested = onCutRequested,
+            onSelectAllRequested = onSelectAllRequested,
+          )
+        }
+
+        override fun hide() {
+          isSelectionToolbarVisible = false
+          baseToolbar.hide()
+        }
+      }
+    }
+
+  fun clearActiveTextSelection() {
+    isSelectionToolbarVisible = false
+    trackedToolbar.hide()
+    focusManager.clearFocus(force = true)
+    selectionResetEpoch++
+  }
+
+  CompositionLocalProvider(LocalTextToolbar provides trackedToolbar) {
     Box(
       modifier =
-        Modifier.fillMaxSize()
-          .pointerInput(Unit) {
-            detectTapGestures(
-              onDoubleTap = {
-                if (zoomScale > 1.15f) {
-                  animateZoomTo(1f)
-                } else {
-                  animateZoomTo(2f)
+        modifier
+          .fillMaxSize()
+          .background(if (nightInvert) Color(0xFF0E1014) else MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+      // Fast-path zoom/pan + tap-anywhere to cancel active text selection
+      Box(
+        modifier =
+          Modifier.fillMaxSize()
+            .pointerInput(Unit) {
+              awaitEachGesture {
+                val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Final)
+                val wasActiveOnDown =
+                  isSelectionToolbarVisible || baseToolbar.status == TextToolbarStatus.Shown
+                val startPos = down.position
+                val downTime = System.currentTimeMillis()
+                var moved = false
+                var multiTouch = false
+                while (true) {
+                  val event = awaitPointerEvent(PointerEventPass.Final)
+                  if (event.changes.size > 1) multiTouch = true
+                  val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                  if ((change.position - startPos).getDistance() > viewConfiguration.touchSlop) {
+                    moved = true
+                  }
+                  if (!change.pressed) break
                 }
-              },
-            )
-          }
-          .pointerInput(Unit) {
+                if (
+                  wasActiveOnDown &&
+                    !moved &&
+                    !multiTouch &&
+                    (System.currentTimeMillis() - downTime) < 350L
+                ) {
+                  suppressDoubleTapUntil = System.currentTimeMillis() + 380L
+                  clearActiveTextSelection()
+                }
+              }
+            }
+            .pointerInput(Unit) {
+              detectTapGestures(
+                onDoubleTap = {
+                  if (System.currentTimeMillis() < suppressDoubleTapUntil) return@detectTapGestures
+                  if (isSelectionToolbarVisible || baseToolbar.status == TextToolbarStatus.Shown) {
+                    clearActiveTextSelection()
+                    return@detectTapGestures
+                  }
+                  if (zoomScale > 1.15f) {
+                    animateZoomTo(1f)
+                  } else {
+                    animateZoomTo(2f)
+                  }
+                },
+              )
+            }
+            .pointerInput(Unit) {
             awaitEachGesture {
               awaitFirstDown(requireUnconsumed = false)
               do {
@@ -297,6 +383,7 @@ fun PdfViewerContent(
             helper = helper,
             pageIndex = pageIndex,
             isScrollingState = isScrollingState,
+            selectionResetKey = selectionResetEpoch,
             nightInvert = nightInvert,
             isHighlightedPage = activeHit?.pageIndex == pageIndex,
             pageSearchHits = hitsByPage[pageIndex].orEmpty(),
@@ -447,6 +534,7 @@ fun PdfViewerContent(
         }
       }
     }
+    }
   }
 
   if (showJumpDialog) {
@@ -488,6 +576,7 @@ private fun PdfPageCard(
   helper: PdfRendererHelper,
   pageIndex: Int,
   isScrollingState: State<Boolean>,
+  selectionResetKey: Int,
   nightInvert: Boolean,
   isHighlightedPage: Boolean,
   pageSearchHits: List<PdfSearchHit>,
@@ -541,6 +630,7 @@ private fun PdfPageCard(
       PdfSelectionContainer(
         words = wordsState,
         onNoSelectableText = onNoSelectableText,
+        selectionResetKey = selectionResetKey,
         modifier = Modifier.fillMaxWidth().aspectRatio(ratio),
       ) {
         Image(
